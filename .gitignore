@@ -1,0 +1,9 @@
+.DS_Store
+dist/
+t3code/
+
+pebblecode/build/
+pebblecode/.lock-waf_*
+
+*.log
+*.tmp
