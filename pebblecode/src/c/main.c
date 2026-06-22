@@ -695,7 +695,7 @@ static void menu_draw_header_callback(GContext *ctx, const Layer *cell_layer, ui
   graphics_fill_rect(ctx, GRect(PANEL_EDGE, 3, bounds.size.w - (PANEL_EDGE * 2), bounds.size.h - 6), 0, GCornerNone);
   graphics_context_set_fill_color(ctx, theme_purple());
   graphics_fill_rect(ctx, GRect(0, 0, PANEL_EDGE, bounds.size.h), 0, GCornerNone);
-  graphics_context_set_fill_color(ctx, theme_cyan());
+  graphics_context_set_fill_color(ctx, theme_orange());
   graphics_fill_rect(ctx, GRect(PANEL_EDGE, bounds.size.h - 2, bounds.size.w - PANEL_EDGE, 2), 0, GCornerNone);
   graphics_context_set_fill_color(ctx, theme_orange());
   graphics_fill_rect(ctx, GRect(bounds.size.w - 18, 0, 18, 3), 0, GCornerNone);
@@ -703,7 +703,7 @@ static void menu_draw_header_callback(GContext *ctx, const Layer *cell_layer, ui
   graphics_draw_line(ctx, GPoint(PANEL_EDGE, 2), GPoint(bounds.size.w - 20, 2));
   if (section_index == 0 && (showing_initial_sync() || s_loading)) {
     int pulse_x = PANEL_EDGE + 8 + (s_stream_phase % 24);
-    graphics_context_set_fill_color(ctx, theme_cyan());
+    graphics_context_set_fill_color(ctx, theme_orange());
     graphics_fill_rect(ctx, GRect(pulse_x, bounds.size.h - 4, 14, 2), 0, GCornerNone);
   }
   graphics_context_set_text_color(ctx, theme_cyan());
@@ -740,7 +740,7 @@ static GColor theme_bg(void) {
 
 static GColor theme_panel(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0x092033);
+  return GColorFromHEX(0x1A0B10);
 #else
   return GColorBlack;
 #endif
@@ -748,7 +748,7 @@ static GColor theme_panel(void) {
 
 static GColor theme_purple(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0x0C3D86);
+  return GColorFromHEX(0x5A1020);
 #else
   return GColorBlack;
 #endif
@@ -756,7 +756,7 @@ static GColor theme_purple(void) {
 
 static GColor theme_deep_purple(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0x07152A);
+  return GColorFromHEX(0x231018);
 #else
   return GColorBlack;
 #endif
@@ -788,7 +788,7 @@ static GColor theme_orange(void) {
 
 static GColor theme_muted(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0xB8D6E8);
+  return GColorFromHEX(0xD6B4AA);
 #else
   return GColorWhite;
 #endif
@@ -796,7 +796,7 @@ static GColor theme_muted(void) {
 
 static GColor theme_text(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0xF4FBFF);
+  return GColorFromHEX(0xFFF3EE);
 #else
   return GColorWhite;
 #endif
@@ -804,7 +804,7 @@ static GColor theme_text(void) {
 
 static GColor theme_selected_text(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0xF8FFFF);
+  return GColorFromHEX(0xFFF7EF);
 #else
   return GColorWhite;
 #endif
@@ -812,7 +812,7 @@ static GColor theme_selected_text(void) {
 
 static GColor theme_cyan(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0x18E7FF);
+  return GColorFromHEX(0xD8C8B8);
 #else
   return GColorWhite;
 #endif
@@ -820,7 +820,7 @@ static GColor theme_cyan(void) {
 
 static GColor theme_blue(void) {
 #ifdef PBL_COLOR
-  return GColorFromHEX(0x0A315A);
+  return GColorFromHEX(0x102C42);
 #else
   return GColorBlack;
 #endif
@@ -884,7 +884,7 @@ static GColor status_color(const char *status) {
     return theme_cyan();
   }
   if (strcmp(status, "Error") == 0) {
-    return GColorRed;
+    return theme_red();
   }
 #endif
   return GColorWhite;
@@ -1207,19 +1207,19 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
 	      graphics_fill_rect(ctx, GRect(panel.origin.x + 4, panel.origin.y + 3, panel.size.w - 8, panel.size.h - 6), 0, GCornerNone);
 	    }
     bool sending_here = s_sending_message && cell_index->row == s_selected_project_index;
-    draw_hud_ticks(ctx, panel, sending_here ? theme_orange() : (selected ? theme_cyan() : theme_purple()), selected || sending_here);
-    draw_press_sweep(ctx, panel, sending_here ? theme_orange() : theme_cyan(), pressed ? s_menu_select_ticks : 0);
+    draw_hud_ticks(ctx, panel, sending_here ? theme_orange() : (selected ? theme_orange() : theme_purple()), selected || sending_here);
+    draw_press_sweep(ctx, panel, theme_orange(), pressed ? s_menu_select_ticks : 0);
 
-    graphics_context_set_fill_color(ctx, theme_cyan());
+    graphics_context_set_fill_color(ctx, theme_orange());
     graphics_fill_rect(ctx, GRect(0, 0, PANEL_EDGE, bounds.size.h), 0, GCornerNone);
-    graphics_context_set_fill_color(ctx, selected ? theme_cyan() : theme_deep_purple());
+    graphics_context_set_fill_color(ctx, selected ? theme_orange() : theme_deep_purple());
     graphics_fill_rect(ctx, GRect(9, 5, 13, 13), 0, GCornerNone);
     graphics_context_set_text_color(ctx, selected ? GColorBlack : theme_cyan());
     graphics_draw_text(ctx, "+", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
                        GRect(9, 2, 13, 16), GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
     if (selected) {
-      graphics_context_set_fill_color(ctx, theme_cyan());
+      graphics_context_set_fill_color(ctx, theme_orange());
       graphics_fill_rect(ctx, GRect(PANEL_EDGE, 0, bounds.size.w - PANEL_EDGE, 2), 0, GCornerNone);
       graphics_context_set_fill_color(ctx, theme_bright_purple());
       graphics_fill_rect(ctx, GRect(23, 4, 3, bounds.size.h - 8), 0, GCornerNone);
@@ -1235,7 +1235,7 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
 		    graphics_draw_text(ctx, subtitle, fonts_get_system_font(FONT_KEY_GOTHIC_14),
 		                       sub_rect, GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-    graphics_context_set_stroke_color(ctx, selected ? theme_cyan() : theme_deep_purple());
+    graphics_context_set_stroke_color(ctx, selected ? theme_orange() : theme_deep_purple());
     graphics_draw_line(ctx, GPoint(PANEL_EDGE, bounds.size.h - 1), GPoint(bounds.size.w, bounds.size.h - 1));
     return;
   }
@@ -1252,7 +1252,7 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
     draw_hud_ticks(ctx, sync_panel, theme_cyan(), s_loading || showing_initial_sync());
     graphics_context_set_fill_color(ctx, theme_purple());
     graphics_fill_rect(ctx, GRect(0, 0, PANEL_EDGE, bounds.size.h), 0, GCornerNone);
-    graphics_context_set_fill_color(ctx, theme_cyan());
+    graphics_context_set_fill_color(ctx, theme_orange());
     graphics_fill_rect(ctx, GRect(PANEL_EDGE, 0, bounds.size.w - PANEL_EDGE, 2), 0, GCornerNone);
 	    graphics_context_set_fill_color(ctx, theme_orange());
 	    graphics_fill_rect(ctx, GRect(bounds.size.w - 6, 4, 3, bounds.size.h - 9), 0, GCornerNone);
@@ -1298,24 +1298,25 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
 	    graphics_fill_rect(ctx, GRect(panel.origin.x + 4, panel.origin.y + 3, panel.size.w - 8, panel.size.h - 6), 0, GCornerNone);
 	  }
   bool needs_input = strcmp(item->status, "Needs input") == 0;
+  bool is_error = strcmp(item->status, "Error") == 0;
   bool is_running = status_is_running(item->status);
   bool is_sending = s_sending_message && cell_index->row == s_selected_index;
-  draw_hud_ticks(ctx, panel, is_sending ? theme_orange() : (selected ? theme_cyan() : status_color(item->status)), selected || is_running || is_sending);
+  draw_hud_ticks(ctx, panel, is_sending ? theme_orange() : (selected ? theme_orange() : status_color(item->status)), selected || is_running || is_sending);
   draw_press_sweep(ctx, panel, is_sending ? theme_orange() : status_color(item->status), pressed ? s_menu_select_ticks : 0);
 
   graphics_context_set_fill_color(ctx, status_color(item->status));
   graphics_fill_rect(ctx, GRect(0, 0, PANEL_EDGE, bounds.size.h), 0, GCornerNone);
 
-  graphics_context_set_fill_color(ctx, selected ? theme_cyan() : theme_deep_purple());
+  graphics_context_set_fill_color(ctx, selected ? theme_orange() : theme_deep_purple());
   graphics_fill_rect(ctx, GRect(9, 5, 13, 13), 0, GCornerNone);
   graphics_context_set_text_color(ctx, selected ? GColorBlack : status_color(item->status));
   graphics_draw_text(ctx, status_prefix(item->status), fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
                      GRect(9, 2, 13, 16), GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
-  if (needs_input || strcmp(item->status, "Error") == 0) {
-    graphics_context_set_fill_color(ctx, theme_orange());
+  if (needs_input || is_error) {
+    graphics_context_set_fill_color(ctx, is_error ? theme_red() : theme_orange());
     graphics_fill_rect(ctx, GRect(bounds.size.w - 5, 3, 4, bounds.size.h - 6), 0, GCornerNone);
-	  }
+		  }
   if (is_running) {
     draw_running_pip(ctx, bounds, status_color(item->status));
   }
@@ -1324,7 +1325,7 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
 	  }
 
   if (selected) {
-    graphics_context_set_fill_color(ctx, theme_cyan());
+    graphics_context_set_fill_color(ctx, theme_orange());
     graphics_fill_rect(ctx, GRect(PANEL_EDGE, 0, bounds.size.w - PANEL_EDGE, 2), 0, GCornerNone);
     graphics_context_set_fill_color(ctx, theme_bright_purple());
     graphics_fill_rect(ctx, GRect(23, 4, 3, bounds.size.h - 8), 0, GCornerNone);
@@ -1340,7 +1341,7 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
 		  graphics_draw_text(ctx, subtitle, fonts_get_system_font(FONT_KEY_GOTHIC_14),
 		                     sub_rect, GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  graphics_context_set_stroke_color(ctx, selected ? theme_cyan() : theme_deep_purple());
+  graphics_context_set_stroke_color(ctx, selected ? theme_orange() : theme_deep_purple());
   graphics_draw_line(ctx, GPoint(PANEL_EDGE, bounds.size.h - 1), GPoint(bounds.size.w, bounds.size.h - 1));
 }
 
@@ -1366,7 +1367,7 @@ static void detail_header_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, GRect(0, 0, PANEL_EDGE, bounds.size.h), 0, GCornerNone);
   graphics_context_set_fill_color(ctx, theme_purple());
   graphics_fill_rect(ctx, GRect(PANEL_EDGE, 0, bounds.size.w - PANEL_EDGE, 3), 0, GCornerNone);
-  graphics_context_set_fill_color(ctx, theme_cyan());
+  graphics_context_set_fill_color(ctx, theme_orange());
   graphics_fill_rect(ctx, GRect(PANEL_EDGE, bounds.size.h - 2, bounds.size.w - PANEL_EDGE, 2), 0, GCornerNone);
   graphics_context_set_fill_color(ctx, theme_bright_purple());
   graphics_fill_rect(ctx, GRect(9, 6, 3, bounds.size.h - 14), 0, GCornerNone);
@@ -1377,7 +1378,7 @@ static void detail_header_update_proc(Layer *layer, GContext *ctx) {
   draw_press_sweep(ctx, GRect(6, 5, bounds.size.w - 12, bounds.size.h - 10), theme_cyan(), s_detail_open_ticks);
 
   if (needs_input || strcmp(item->status, "Error") == 0) {
-    graphics_context_set_fill_color(ctx, theme_orange());
+    graphics_context_set_fill_color(ctx, strcmp(item->status, "Error") == 0 ? theme_red() : theme_orange());
     graphics_fill_rect(ctx, GRect(bounds.size.w - 5, 6, 4, bounds.size.h - 14), 0, GCornerNone);
   } else if (selected_session_running()) {
     graphics_context_set_fill_color(ctx, status_color(item->status));
@@ -1877,7 +1878,7 @@ static void menu_window_load(Window *window) {
 
   s_status_layer = text_layer_create(GRect(0, 0, bounds.size.w, STATUS_BAR_HEIGHT));
   text_layer_set_background_color(s_status_layer, theme_deep_purple());
-  text_layer_set_text_color(s_status_layer, theme_cyan());
+  text_layer_set_text_color(s_status_layer, theme_orange());
   text_layer_set_font(s_status_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
   text_layer_set_text_alignment(s_status_layer, GTextAlignmentCenter);
   text_layer_set_text(s_status_layer, s_status_text);
