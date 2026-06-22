@@ -180,7 +180,7 @@ function createBridge(baseUrl, state) {
   }
   vm.createContext(context)
   vm.runInContext(source, context)
-  return { listeners, sentMessages }
+  return { context, listeners, sentMessages }
 }
 
 function waitFor(predicate) {
@@ -235,10 +235,88 @@ async function main() {
   assert.strictEqual(blocked.request_id, "per_1")
   assert.strictEqual(done.status, "Done")
 
-  bridge.listeners.appmessage({ payload: { cmd: 7, session_id: "ses_done", index: 2 } })
+  bridge.listeners.appmessage({ payload: { cmd: 7, session_id: "ses_done", index: 2, request_id: "ctx_a" } })
   const contextMessage = await waitFor(() => bridge.sentMessages.find((message) => message.cmd === 7))
-  assert.match(contextMessage.context, /You: Write the install notes/)
-  assert.match(contextMessage.context, /Agent: Install notes are drafted/)
+  assert.strictEqual(contextMessage.request_id, "ctx_a")
+  assert.match(contextMessage.context, /You\nWrite the install notes/)
+  assert.match(contextMessage.context, /Agent\nInstall notes are drafted/)
+  assert.strictEqual(contextMessage.context_page, 0)
+  assert.ok(Buffer.byteLength(contextMessage.context, "utf8") <= 480)
+
+  const doneThread = state.snapshot.threads.find((thread) => thread.id === "ses_done")
+  doneThread.messages = []
+  for (let i = 0; i < 12; i++) {
+    doneThread.messages.push({
+      id: `msg_long_user_${i}`,
+      role: "user",
+      text: `Long prompt ${i} ` + "neon genesis 🚀 ".repeat(25),
+      streaming: false,
+      createdAt: `2026-01-01T00:${String(i).padStart(2, "0")}:01.000Z`,
+      updatedAt: `2026-01-01T00:${String(i).padStart(2, "0")}:01.000Z`,
+    })
+    doneThread.messages.push({
+      id: `msg_long_agent_${i}`,
+      role: "assistant",
+      text: `Long answer ${i} ` + "cyber signal ".repeat(30),
+      streaming: false,
+      createdAt: `2026-01-01T00:${String(i).padStart(2, "0")}:02.000Z`,
+      updatedAt: `2026-01-01T00:${String(i).padStart(2, "0")}:02.000Z`,
+    })
+  }
+  doneThread.messages.push({
+    id: "msg_final_long_agent",
+    role: "assistant",
+    text: "Final assistant response " + "keeps flowing through pagination ".repeat(45) + "FINAL_CONTEXT_SENTINEL",
+    streaming: false,
+    createdAt: "2026-01-01T00:20:02.000Z",
+    updatedAt: "2026-01-01T00:20:02.000Z",
+  })
+  bridge.context.lastSnapshot = state.snapshot
+
+  const contextCount = () => bridge.sentMessages.filter((message) => message.cmd === 7).length
+  const beforePage0 = contextCount()
+  bridge.listeners.appmessage({ payload: { cmd: 7, session_id: "ses_done", index: 2, context_page: 0, request_id: "ctx_p0" } })
+  const page0 = await waitFor(() => {
+    const messages = bridge.sentMessages.filter((message) => message.cmd === 7)
+    return messages.length > beforePage0 && messages[messages.length - 1]
+  })
+  assert.strictEqual(page0.context_page, 0)
+  assert.strictEqual(page0.request_id, "ctx_p0")
+  assert.ok(page0.total > 1)
+  assert.ok(Buffer.byteLength(page0.context, "utf8") <= 480)
+
+  const beforePage1 = contextCount()
+  bridge.listeners.appmessage({ payload: { cmd: 7, session_id: "ses_done", index: 2, context_page: 1, request_id: "ctx_p1" } })
+  const page1 = await waitFor(() => {
+    const messages = bridge.sentMessages.filter((message) => message.cmd === 7)
+    return messages.length > beforePage1 && messages[messages.length - 1]
+  })
+  assert.strictEqual(page1.context_page, 1)
+  assert.strictEqual(page1.request_id, "ctx_p1")
+  assert.notStrictEqual(page1.context, page0.context)
+  assert.ok(Buffer.byteLength(page1.context, "utf8") <= 480)
+
+  const beforeLast = contextCount()
+  bridge.listeners.appmessage({ payload: { cmd: 7, session_id: "ses_done", index: 2, context_page: 999, request_id: "ctx_last" } })
+  const lastPage = await waitFor(() => {
+    const messages = bridge.sentMessages.filter((message) => message.cmd === 7)
+    return messages.length > beforeLast && messages[messages.length - 1]
+  })
+  assert.strictEqual(lastPage.context_page, lastPage.total - 1)
+  assert.strictEqual(lastPage.request_id, "ctx_last")
+  assert.ok(Buffer.byteLength(lastPage.context, "utf8") <= 480)
+
+  const beforeTail = contextCount()
+  bridge.listeners.appmessage({ payload: { cmd: 7, session_id: "ses_done", index: 2, context_page: -1, request_id: "ctx_tail" } })
+  const tailPage = await waitFor(() => {
+    const messages = bridge.sentMessages.filter((message) => message.cmd === 7)
+    return messages.length > beforeTail && messages[messages.length - 1]
+  })
+  assert.strictEqual(tailPage.context_page, tailPage.total - 1)
+  assert.strictEqual(tailPage.request_id, "ctx_tail")
+  assert.strictEqual(tailPage.context, lastPage.context)
+  assert.ok(!tailPage.context.includes("..."))
+  assert.match(tailPage.context, /FINAL_CONTEXT_SENTINEL/)
 
   bridge.listeners.appmessage({
     payload: {

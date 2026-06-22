@@ -308,8 +308,39 @@ async function main() {
         parts: [{ type: "text", text: "Continuing now." }],
       },
     ]),
-    /You: Please continue/,
+    /You\nPlease continue/,
   )
+
+  const longTranscript = [
+    "You\n" + "alpha ".repeat(120),
+    "Agent\n" + "beta ".repeat(120),
+    "System\n" + "gamma ".repeat(120),
+  ].join("\n\n")
+  const pages = context.paginateText(longTranscript, 480)
+  assert.ok(pages.length > 1)
+  assert.ok(pages.every((page) => Buffer.byteLength(page, "utf8") <= 480))
+  assertJsonEqual(context.paginateText(" \n\n ", 480), ["No context yet."])
+
+  const unicodePages = context.paginateText("You\n" + "neon 🚀 ".repeat(180), 480)
+  assert.ok(unicodePages.length > 1)
+  assert.ok(unicodePages.every((page) => Buffer.byteLength(page, "utf8") <= 480))
+  assert.ok(unicodePages.every((page) => !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(page)))
+  assert.ok(unicodePages.every((page) => !page.includes("...")))
+
+  const longFinalSentence = "Agent\n" + "This is a long final assistant message ".repeat(40) + "FINAL_SENTINEL_WORD"
+  const fullTranscript = context.contextFromMessages([
+    {
+      info: { role: "assistant", time: { created: 3 }, finish: "stop" },
+      parts: [{ type: "text", text: longFinalSentence.slice("Agent\n".length) }],
+    },
+  ])
+  assert.ok(fullTranscript.includes("FINAL_SENTINEL_WORD"))
+  assert.ok(!fullTranscript.includes("..."))
+  const finalPages = context.paginateText(fullTranscript, 480)
+  assert.ok(finalPages.length > 1)
+  assert.ok(finalPages.every((page) => Buffer.byteLength(page, "utf8") <= 480))
+  assert.ok(finalPages.every((page) => !page.includes("...")))
+  assert.ok(finalPages[finalPages.length - 1].includes("FINAL_SENTINEL_WORD"))
 
   storedSettings = JSON.stringify({ baseUrl: "http://100.64.0.10:3773", username: "t3code", password: "secret" })
   snapshot = makeSnapshot()

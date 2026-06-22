@@ -13,6 +13,7 @@ var KEY_ERROR = "error";
 var KEY_REQUEST_ID = "request_id";
 var KEY_REQUEST_KIND = "request_kind";
 var KEY_PROJECT_ID = "project_id";
+var KEY_CONTEXT_PAGE = "context_page";
 
 var CMD_REFRESH = 1;
 var CMD_SESSION_ITEM = 2;
@@ -27,9 +28,11 @@ var CMD_PROJECT_END = 10;
 var CMD_NEW_THREAD = 11;
 
 var MAX_SESSIONS = 20;
-var SUMMARY_LIMIT = 190;
-var CONTEXT_LIMIT = 1200;
+var SUMMARY_LIMIT = 150;
+var CONTEXT_LIMIT = 480;
+var CONTEXT_MESSAGE_LIMIT = 60;
 var ENRICH_CONCURRENCY = 4;
+var MAX_APP_MESSAGE_FAILURES = 8;
 var BUILD_LABEL = "v0.1.0";
 var DEFAULT_BASE_URL = "";
 var DEFAULT_USERNAME = "t3code";
@@ -45,6 +48,7 @@ var DEFAULT_SETTINGS = {
 
 var appMessageQueue = [];
 var appMessageBusy = false;
+var appMessageFailureCount = 0;
 var pendingBySession = {};
 var runtimeStatusBySession = {};
 var cachedSessions = {};
@@ -135,6 +139,103 @@ function compactTail(value, limit) {
     return value.slice(value.length - limit);
   }
   return "..." + value.slice(value.length - limit + 3);
+}
+
+function compactLine(value, limit) {
+  value = String(value || "").replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
+  if (value.length <= limit) {
+    return value;
+  }
+  if (limit <= 3) {
+    return value.slice(0, limit);
+  }
+  return value.slice(0, limit - 3) + "...";
+}
+
+function compactMultilineTail(value, limit) {
+  value = String(value || "").replace(/\r/g, "").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/^\s+|\s+$/g, "");
+  if (value.length <= limit) {
+    return value;
+  }
+  if (limit <= 3) {
+    return value.slice(value.length - limit);
+  }
+  return "...\n" + value.slice(value.length - limit + 4).replace(/^\s+/, "");
+}
+
+function utf8Length(value) {
+  value = String(value || "");
+  if (typeof Buffer !== "undefined") {
+    return Buffer.byteLength(value, "utf8");
+  }
+  return unescape(encodeURIComponent(value)).length;
+}
+
+function trimToUtf8Bytes(value, byteLimit) {
+  return trimToUtf8BytesWithIndex(value, byteLimit).text;
+}
+
+function trimToUtf8BytesWithIndex(value, byteLimit) {
+  value = String(value || "");
+  var result = "";
+  for (var i = 0; i < value.length; i++) {
+    var start = i;
+    var unit = value.charAt(i);
+    var code = value.charCodeAt(i);
+    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < value.length) {
+      var nextCode = value.charCodeAt(i + 1);
+      if (nextCode >= 0xDC00 && nextCode <= 0xDFFF) {
+        unit += value.charAt(i + 1);
+        i++;
+      }
+    }
+    var next = result + unit;
+    if (utf8Length(next) > byteLimit) {
+      return { text: result, nextIndex: start };
+    }
+    result = next;
+  }
+  return { text: result, nextIndex: value.length };
+}
+
+function splitUtf8Page(value, byteLimit) {
+  value = String(value || "");
+  var hard = trimToUtf8BytesWithIndex(value, byteLimit);
+  if (hard.nextIndex >= value.length) {
+    return hard;
+  }
+
+  var splitIndex = -1;
+  var minIndex = Math.floor(hard.text.length * 0.55);
+  for (var i = hard.text.length - 1; i >= minIndex; i--) {
+    if (/\s/.test(hard.text.charAt(i))) {
+      splitIndex = i;
+      break;
+    }
+  }
+
+  if (splitIndex > 0) {
+    var nextIndex = splitIndex + 1;
+    while (nextIndex < value.length && /\s/.test(value.charAt(nextIndex))) {
+      nextIndex++;
+    }
+    return {
+      text: value.slice(0, splitIndex).replace(/\s+$/g, ""),
+      nextIndex: nextIndex
+    };
+  }
+
+  return hard;
+}
+
+function transcriptText(value) {
+  return String(value || "")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^\s+|\s+$/g, "");
 }
 
 function responseList(response) {
@@ -310,10 +411,19 @@ function flushMessages() {
     return;
   }
   appMessageBusy = true;
-  Pebble.sendAppMessage(appMessageQueue.shift(), function() {
+  var message = appMessageQueue.shift();
+  Pebble.sendAppMessage(message, function() {
+    appMessageFailureCount = 0;
     appMessageBusy = false;
     flushMessages();
   }, function() {
+    appMessageFailureCount++;
+    if (appMessageFailureCount <= MAX_APP_MESSAGE_FAILURES) {
+      appMessageQueue.unshift(message);
+    } else {
+      appMessageFailureCount = 0;
+      sendError("Watch link dropped a message");
+    }
     appMessageBusy = false;
     setTimeout(flushMessages, 250);
   });
@@ -349,6 +459,7 @@ function makeMessage(command, fields) {
   if (fields.requestId !== undefined) message[KEY_REQUEST_ID] = fields.requestId;
   if (fields.requestKind !== undefined) message[KEY_REQUEST_KIND] = fields.requestKind;
   if (fields.projectId !== undefined) message[KEY_PROJECT_ID] = fields.projectId;
+  if (fields.contextPage !== undefined) message[KEY_CONTEXT_PAGE] = fields.contextPage;
   return message;
 }
 
@@ -935,7 +1046,7 @@ function toQuickItem(session) {
     fullDirectory: directory,
     agent: compact(session.agent || "agent", 20),
     status: compact(session.status || "Idle", 16),
-    summary: compact(session.summary || "Select for latest summary.", SUMMARY_LIMIT),
+    summary: compact(session.summary || "Awaiting latest signal.", SUMMARY_LIMIT),
     requestId: session.requestId || "",
     requestKind: session.requestKind || ""
   };
@@ -1000,12 +1111,12 @@ function pendingSummary(pending) {
     var resources = (request.resources || request.patterns || request.always || []).join(", ");
     var action = request.action || request.permission || "permission";
     var tool = request.tool && request.tool.callID ? " for tool " + request.tool.callID : "";
-    return compact("Needs permission: " + action + tool + (resources ? " on " + resources : "") + ". Say yes, always, or no.", SUMMARY_LIMIT);
+    return compact("Needs permission: " + action + tool + (resources ? " on " + resources : "") + ".", SUMMARY_LIMIT);
   }
 
   var questions = request.questions || [];
   if (questions.length === 0) {
-    return "Needs an answer. Select and dictate a reply.";
+    return "Needs an answer.";
   }
 
   var first = questions[0];
@@ -1014,9 +1125,6 @@ function pendingSummary(pending) {
   }).join(", ");
   var prefix = questions.length > 1 ? questions.length + " questions. First: " : "Question: ";
   var suffix = options ? " Options: " + options + "." : "";
-  if (questions.length > 1) {
-    suffix += " Separate answers with semicolons.";
-  }
   return compact(prefix + first.question + suffix, SUMMARY_LIMIT);
 }
 
@@ -1194,20 +1302,82 @@ function detail(sessionId, index) {
   });
 }
 
-function context(sessionId, index) {
+function context(sessionId, index, page, requestId) {
   var session = cachedSessions[sessionId] || { id: sessionId };
-  loadMessages(sessionId, 20, sessionDirectory(session), function(error, response) {
+  loadMessages(sessionId, CONTEXT_MESSAGE_LIMIT, sessionDirectory(session), function(error, response) {
     if (error) {
       sendError(error);
       return;
     }
     var messages = oldestFirst(responseList(response));
+    var pages = paginateText(contextFromMessages(messages), CONTEXT_LIMIT);
+    var pageIndex = clampPage(page, pages.length);
     send(makeMessage(CMD_CONTEXT, {
       index: index,
       id: sessionId,
-      context: compactTail(contextFromMessages(messages), CONTEXT_LIMIT)
+      total: pages.length,
+      contextPage: pageIndex,
+      requestId: requestId || "",
+      context: pages[pageIndex]
     }));
   });
+}
+
+function clampPage(page, pageCount) {
+  page = parseInt(page, 10);
+  if (pageCount < 1) {
+    return 0;
+  }
+  if (page === -1) {
+    return pageCount - 1;
+  }
+  if (isNaN(page) || page < 0) {
+    return 0;
+  }
+  if (page >= pageCount) {
+    return pageCount - 1;
+  }
+  return page;
+}
+
+function paginateText(value, limit) {
+  value = String(value || "").replace(/\r/g, "").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/^\s+|\s+$/g, "");
+  if (!value) {
+    return ["No context yet."];
+  }
+  var paragraphs = value.split(/\n\n/g);
+  var pages = [];
+  var current = "";
+
+  function pushCurrent() {
+    if (current) {
+      pages.push(current);
+      current = "";
+    }
+  }
+
+  for (var i = 0; i < paragraphs.length; i++) {
+    var paragraph = paragraphs[i];
+    while (utf8Length(paragraph) > limit) {
+      pushCurrent();
+      var chunk = splitUtf8Page(paragraph, limit);
+      if (!chunk.text) {
+        break;
+      }
+      pages.push(chunk.text);
+      paragraph = paragraph.slice(chunk.nextIndex).replace(/^\s+/g, "");
+    }
+
+    var next = current ? current + "\n\n" + paragraph : paragraph;
+    if (utf8Length(next) > limit) {
+      pushCurrent();
+      current = paragraph;
+    } else {
+      current = next;
+    }
+  }
+  pushCurrent();
+  return pages.length ? pages : ["No context yet."];
 }
 
 function contextFromMessages(messages) {
@@ -1217,19 +1387,19 @@ function contextFromMessages(messages) {
     if (isUserMessage(message)) {
       var userText = userMessageText(message);
       if (userText) {
-        lines.push("You: " + userText);
+        lines.push("You\n" + transcriptText(userText));
       }
     } else if (message.type === "assistant" || messageInfo(message).role === "assistant") {
       var text = assistantText(message);
       if (text) {
-        lines.push("Agent: " + text);
+        lines.push("Agent\n" + transcriptText(text));
       } else if (messageError(message)) {
-        lines.push("Error: " + (messageError(message).message || "unknown"));
+        lines.push("Error\n" + transcriptText(messageError(message).message || "unknown"));
       }
     } else if (message.type === "system" && message.text) {
-      lines.push("System: " + message.text);
+      lines.push("System\n" + transcriptText(message.text));
     } else if (message.type === "synthetic" && message.text) {
-      lines.push("Note: " + message.text);
+      lines.push("Note\n" + transcriptText(message.text));
     }
   }
   return lines.join("\n\n") || "No context yet.";
@@ -1601,7 +1771,7 @@ Pebble.addEventListener("appmessage", function(event) {
   } else if (command === CMD_DETAIL) {
     detail(message[KEY_SESSION_ID], message[KEY_INDEX] || 0);
   } else if (command === CMD_CONTEXT) {
-    context(message[KEY_SESSION_ID], message[KEY_INDEX] || 0);
+    context(message[KEY_SESSION_ID], message[KEY_INDEX] || 0, message[KEY_CONTEXT_PAGE] || 0, message[KEY_REQUEST_ID]);
   } else if (command === CMD_PROMPT) {
     submitResponse(message);
   } else if (command === CMD_NEW_THREAD) {

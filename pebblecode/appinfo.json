@@ -3,10 +3,15 @@
   "shortName": "t3pebble",
   "longName": "T3 Pebble",
   "companyName": "Pebble",
-  "versionLabel": "0.1.0",
+  "versionLabel": "0.1",
   "sdkVersion": "3",
   "enableMultiJS": true,
-  "targetPlatforms": ["basalt", "chalk", "diorite", "emery"],
+  "targetPlatforms": [
+    "basalt",
+    "chalk",
+    "diorite",
+    "emery"
+  ],
   "watchapp": {
     "watchface": false
   },
@@ -25,10 +30,13 @@
     "error": 11,
     "request_id": 12,
     "request_kind": 13,
-    "project_id": 14
+    "project_id": 14,
+    "context_page": 15
   },
   "resources": {
     "media": []
   },
-  "capabilities": ["configurable"]
+  "capabilities": [
+    "configurable"
+  ]
 }
