@@ -483,6 +483,46 @@ async function main() {
   assert.strictEqual(dispatches[0].modelSelection.model, "gpt-5.5")
   assert.strictEqual(dispatches[0].bootstrap.createThread.modelSelection.model, "gpt-5.5")
 
+  snapshot = makeSnapshot({
+    projects: [
+      {
+        id: "proj_instance",
+        title: "Pebble Instance",
+        workspaceRoot: "/repo/pebble-instance",
+        defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+    threads: [
+      {
+        id: "ses_instance",
+        projectId: "proj_instance",
+        title: "Canonical thread",
+        modelSelection: { instanceId: "codex", model: "gpt-5.5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        session: { status: "idle" },
+        latestTurn: { state: "completed" },
+        activities: [],
+        messages: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:03.000Z",
+      },
+    ],
+  })
+  context.lastSnapshot = snapshot
+  dispatches = []
+  context.promptNewThread("proj_instance", "start canonical work")
+  await waitFor(() => dispatches.length === 1)
+  assert.strictEqual(dispatches[0].modelSelection.provider, "codex")
+  assert.strictEqual(dispatches[0].modelSelection.instanceId, "codex")
+  assert.strictEqual(dispatches[0].modelSelection.model, "gpt-5.5")
+  assert.strictEqual(dispatches[0].bootstrap.createThread.modelSelection.instanceId, "codex")
+
+  const canonicalSession = context.toPebbleSession(snapshot, snapshot.threads[0])
+  assert.strictEqual(canonicalSession.agent, "codex")
+
   console.log("phone bridge tests passed")
 }
 

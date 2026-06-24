@@ -528,11 +528,13 @@ function threadDirectory(snapshot, thread) {
 
 function modelSelection(selection) {
   if (!selection) {
-    return { provider: "codex", model: PEBBLE_CODEX_MODEL_FALLBACK };
+    return { instanceId: "codex", provider: "codex", model: PEBBLE_CODEX_MODEL_FALLBACK };
   }
-  if (selection.provider === "codex") {
+  var provider = selection.provider || selection.instanceId;
+  if (provider === "codex") {
     return {
-      provider: selection.provider,
+      instanceId: "codex",
+      provider: "codex",
       model: PEBBLE_CODEX_MODEL_FALLBACK,
       options: selection.options
     };
@@ -773,7 +775,7 @@ function toPebbleSession(snapshot, thread) {
     title: compact(thread.title || fileName(directory) || "Untitled", 58),
     directory: compact(directory, 42),
     fullDirectory: directory,
-    agent: compact((thread.session && thread.session.providerName) || (thread.modelSelection && thread.modelSelection.provider) || "agent", 20),
+    agent: compact((thread.session && thread.session.providerName) || (thread.modelSelection && (thread.modelSelection.provider || thread.modelSelection.instanceId)) || "agent", 20),
     status: compact(statusForThread(thread), 16),
     summary: sessionSummaryFromThread(thread),
     requestId: approval ? approval.requestId : (input ? input.requestId : ""),
