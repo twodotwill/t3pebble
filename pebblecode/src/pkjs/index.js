@@ -289,6 +289,14 @@ function rpcRequestId() {
   return String(Date.now()) + String(Math.floor(Math.random() * 1000000));
 }
 
+function rpcHexId(length) {
+  var value = "";
+  while (value.length < length) {
+    value += Math.floor(Math.random() * 0x100000000).toString(16);
+  }
+  return value.slice(0, length);
+}
+
 function rpcRequest(method, payload, callback) {
   var config = settings();
   if (!config.baseUrl) {
@@ -355,6 +363,9 @@ function rpcRequest(method, payload, callback) {
       id: requestId,
       tag: method,
       payload: payload || {},
+      traceId: rpcHexId(32),
+      spanId: rpcHexId(16),
+      sampled: true,
       headers: []
     }));
   };

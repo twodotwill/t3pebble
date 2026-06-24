@@ -351,6 +351,11 @@ async function main() {
 
   await waitFor(() => sentMessages.find((message) => message.cmd === 3))
   assert.ok(sockets[0].url === "ws://100.64.0.10:3773/ws?token=secret")
+  const snapshotRequest = JSON.parse(sockets[0].sent[0])
+  assert.match(snapshotRequest.id, /^\d+$/)
+  assert.match(snapshotRequest.traceId, /^[a-f0-9]{32}$/)
+  assert.match(snapshotRequest.spanId, /^[a-f0-9]{16}$/)
+  assert.strictEqual(snapshotRequest.sampled, true)
   assert.ok(sentMessages.some((message) => message.cmd === 8 && message.status === "v0.1.0 100.64.0.10:3773"))
   assert.ok(sentMessages.some((message) => message.cmd === 8 && message.status === "Found 1 session via t3 ws"))
   assert.ok(sentMessages.some((message) => message.summary === "Built the app. It is ready."))
