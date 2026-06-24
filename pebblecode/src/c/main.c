@@ -1521,7 +1521,7 @@ static void detail_exit_context(bool animated) {
 
 static void detail_back_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_showing_context || s_context_loading) {
-    detail_exit_context(true);
+    detail_exit_context(false);
     return;
   }
   window_stack_pop(true);
