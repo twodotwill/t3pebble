@@ -2,28 +2,25 @@
 
 Pebble Time / Pebble Time 2 watch app for controlling T3 Code threads from the watch.
 
-The watch app is a normal Pebble C app. The phone-side PebbleKit JS bridge talks directly to T3 Code over its WebSocket RPC API; there is no external bridge process.
+The watch app is a normal Pebble C app. The phone-side PebbleKit JS bridge talks directly to T3 Code over its REST orchestration API; there is no external bridge process and no T3 Code fork.
 
 ## Repositories
 
 - T3 Pebble app: https://github.com/twodotwill/t3pebble
-- T3 Code fork/reference: https://github.com/twodotwill/t3code
 - Upstream T3 Code: https://github.com/pingdotgg/t3code
 
 ## Current Compatibility
 
-This Pebble app currently targets the older T3 Code server API from commit `226ed997e1a6493e6b29d5264e0b0f8173e7c630`.
+This app runs against stock, unmodified T3 Code — the published `t3` CLI (verified against `t3@0.0.33`). No server patch, no compatibility branch.
 
-That T3 Code version supports:
+It uses:
 
-- `--auth-token`
-- WebSocket auth with `/ws?token=...`
-- `orchestration.getSnapshot`
-- `orchestration.dispatchCommand`
+- a bearer access token from `t3 auth session issue`
+- `GET /api/orchestration/snapshot` for projects and thread metadata
+- `GET /api/orchestration/threads/:threadId` for thread bodies
+- `POST /api/orchestration/dispatch` for every write
 
-Current upstream T3 Code `0.0.27` changed the remote API to pairing/session auth and shell/thread subscriptions. This app needs a follow-up migration before it can run against current upstream T3 Code after restart.
-
-See [docs/t3code-compatibility.md](docs/t3code-compatibility.md) for the exact differences and the migration plan.
+See [docs/t3code-compatibility.md](docs/t3code-compatibility.md) for the exact API surface this depends on.
 
 ## What Works
 
@@ -39,10 +36,18 @@ See [docs/t3code-compatibility.md](docs/t3code-compatibility.md) for the exact d
 
 ### 1. Install Requirements
 
-On the Mac running T3 Code:
+Install T3 Code the normal way (requires Node.js 22.16+, 23.11+, or 24.10+):
 
 ```sh
-brew install tailscale
+npm install -g t3
+```
+
+`npx t3@latest` works too; the scripts here fall back to it automatically.
+
+On the machine running T3 Code:
+
+```sh
+brew install tailscale   # or your platform's package manager
 ```
 
 Install the Pebble SDK separately and make sure this works:
@@ -51,57 +56,88 @@ Install the Pebble SDK separately and make sure this works:
 pebble --version
 ```
 
-Install Bun for the legacy-compatible T3 Code server:
-
-```sh
-curl -fsSL https://bun.sh/install | bash
-```
-
-### 2. Clone Both Repos
+### 2. Clone This Repo
 
 ```sh
 git clone git@github.com:twodotwill/t3pebble.git
-git clone git@github.com:twodotwill/t3code.git
-cd t3code
-git checkout t3pebble-auth-token-compatible
+cd t3pebble
 ```
 
-The `t3pebble-auth-token-compatible` branch points at the older upstream T3 Code commit that still has the token-based WebSocket API this Pebble app uses.
+There is no second repo to clone. T3 Code is used as shipped.
 
-### 3. Build T3 Code
+### 3. Start T3 Code For Pebble
+
+On any machine you want the watch to reach, with no checkout required:
 
 ```sh
-cd ../t3code
-bun install
-bun run build
+curl -fsSL https://raw.githubusercontent.com/twodotwill/t3pebble/main/run-t3code-tailscale.sh \
+  | T3PEBBLE_TAILSCALE_SERVE=1 bash
 ```
 
-### 4. Start T3 Code For Pebble
+The script fetches its own helpers from the same ref, so nothing else is needed
+on that machine beyond `t3`, `tailscale`, and `curl`. Pin a specific revision
+with `T3PEBBLE_REF=<tag-or-sha>` instead of tracking `main`.
 
-From the `t3pebble` repo:
+From a clone it behaves identically:
 
 ```sh
-T3CODE_DIR=../t3code HOST="$(tailscale ip -4 | head -n 1)" T3PEBBLE_TOKEN=t3 ./run-t3code-tailscale.sh
+./run-t3code-tailscale.sh
 ```
 
-The script prints the values to enter in the Pebble app settings:
+The script binds T3 Code to your Tailscale IP, mints a long-lived bearer access token, and prints the values to enter in the Pebble app settings:
 
 ```text
-Base URL: http://100.x.y.z:3773
-Auth token: t3
+Base URL:     http://100.x.y.z:3773
+Access token: <token>
 ```
 
-For repeat launches after the server has already been built:
+Useful environment variables:
+
+- `HOST` — bind address, if you do not want the Tailscale IP.
+- `PORT` — defaults to `3773`.
+- `T3PEBBLE_TOKEN` — reuse an existing token instead of minting a new one.
+- `T3PEBBLE_TOKEN_TTL` — token lifetime, defaults to `365d`.
+- `T3CODE_BASE_DIR` — explicit T3 Code data directory.
+- `T3_CMD` — override how the `t3` CLI is invoked.
+- `T3PEBBLE_TAILSCALE_SERVE` — set to `1` for Tailscale Serve mode (see below).
+- `T3PEBBLE_SERVE_PORT` — HTTPS port for that mode, defaults to `443`.
+- `T3PEBBLE_LABEL` — watch label for this machine; defaults to its short
+  tailnet name. The watch shows 18 characters.
+
+#### Tailscale Serve mode (optional)
 
 ```sh
-T3PEBBLE_SKIP_BUILD=1 T3CODE_DIR=../t3code T3PEBBLE_TOKEN=t3 ./run-t3code-tailscale.sh
+T3PEBBLE_TAILSCALE_SERVE=1 ./run-t3code-tailscale.sh
 ```
 
-### 5. Build The Pebble App
+Instead of binding the Tailscale IP, this leaves the server on loopback and
+publishes it over tailnet HTTPS, printing a base URL like
+`https://<machine>.<tailnet>.ts.net`. Useful because:
+
+- it works against a T3 Code desktop app, which only listens on `127.0.0.1`
+- the watch talks HTTPS with a real certificate instead of cleartext HTTP
+- no host binding to get right, and no firewall prompt
+
+It needs MagicDNS and HTTPS certificates enabled for the tailnet. The mapping is
+created with `tailscale serve --bg`, so it survives reboots; remove it with
+`tailscale serve --https=443 off`. To keep the server itself running across
+reboots, install it as a service with `t3 service install`.
+
+The Pebble app needs no rebuild for this — the phone bridge already accepts any
+`http://` or `https://` base URL. Only the settings field changes.
+
+To issue a token by hand instead:
 
 ```sh
-cd t3pebble
-T3CODE_DIR=../t3code ./verify-t3pebble.sh
+t3 auth session issue --ttl 365d --label "T3 Pebble watch" --token-only
+```
+
+Tokens are listed and revoked with `t3 auth session list` and `t3 auth session revoke <session-id>`.
+
+### 4. Build The Pebble App
+
+```sh
+./verify-t3pebble.sh
 ```
 
 The installable bundle is written to:
@@ -114,18 +150,34 @@ Install it through the Pebble tooling or the Core Devices/Pebble phone app.
 
 ## Pebble App Settings
 
-Open the app settings from the phone app and set:
+Open the app settings from the phone app. Under **Quick setup**, paste the
+`t3pebble1|...` line the launch script printed and press **Add from paste**:
 
 ```text
-Base URL: http://<tailscale-ip>:3773
-Auth token: <same token used when starting T3 Code>
+t3pebble1|beta1|https://beta1.tailnet.ts.net|<token>
 ```
 
-The phone bridge connects to:
+To attach several machines, run the script on each one and paste every line —
+together or one at a time. Pasting a machine's line again refreshes its token in
+place instead of adding a duplicate, so re-running the script after a token
+expires is all it takes.
+
+Up to 6 machines can be configured. Each appears as its own row on the watch,
+they are queried in parallel, and a machine that is asleep or unreachable shows
+as `offline` without holding up the others.
+
+The fields can still be filled in by hand:
 
 ```text
-ws://<tailscale-ip>:3773/ws?token=<auth-token>
+Base URL:     http://<tailscale-ip>:3773
+Access token: <token from t3 auth session issue>
 ```
+
+The phone bridge sends every request to that base URL with an `Authorization: Bearer <token>` header.
+
+Labels are what the watch shows, and it displays 18 characters. With no label
+set, one is derived from the host — `beta1.tailnet.ts.net` becomes `beta1`.
+Machine names longer than that are worth shortening with `T3PEBBLE_LABEL`.
 
 ## Test Commands
 
@@ -138,14 +190,16 @@ node test/bridge.test.js
 node test/bridge.integration.test.js
 ```
 
-Full local verification, including Pebble build and legacy T3 Code smoke test:
+Full local verification, including the Pebble build and a smoke test against a real stock T3 Code server:
 
 ```sh
-T3CODE_DIR=../t3code ./verify-t3pebble.sh
+./verify-t3pebble.sh
 ```
+
+The smoke test starts `t3 serve` on a throwaway data directory, checks that `/api/orchestration/snapshot` refuses an unauthenticated read, and checks that it answers a bearer token.
 
 ## Why This Exists
 
 Pebble is too constrained to run a full T3 Code client. The phone-side PebbleKit JS bridge gives the watch a compact control surface while the laptop remains the execution environment. Tailscale provides the private network path between phone and laptop.
 
-No T3 Code runtime changes are required for the currently supported legacy-compatible server branch. The Pebble-specific logic lives in this app.
+No T3 Code runtime changes are required. All Pebble-specific logic lives in this app.

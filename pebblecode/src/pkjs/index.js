@@ -14,6 +14,14 @@ var KEY_REQUEST_ID = "request_id";
 var KEY_REQUEST_KIND = "request_kind";
 var KEY_PROJECT_ID = "project_id";
 var KEY_CONTEXT_PAGE = "context_page";
+var KEY_SERVER = "server";
+var KEY_STATE = "state";
+var KEY_HOST_ID = "host_id";
+var KEY_DETAIL = "detail";
+var KEY_C_NEEDS = "c_needs";
+var KEY_C_RUN = "c_run";
+var KEY_C_IDLE = "c_idle";
+var KEY_C_SETTLED = "c_settled";
 
 var CMD_REFRESH = 1;
 var CMD_SESSION_ITEM = 2;
@@ -26,24 +34,56 @@ var CMD_STATUS = 8;
 var CMD_PROJECT_ITEM = 9;
 var CMD_PROJECT_END = 10;
 var CMD_NEW_THREAD = 11;
+var CMD_HOST_ITEM = 12;
+var CMD_HOST_END = 13;
+var CMD_SELECT_HOST = 14;
 
 var MAX_SESSIONS = 20;
 var SUMMARY_LIMIT = 150;
 var CONTEXT_LIMIT = 480;
 var CONTEXT_MESSAGE_LIMIT = 60;
+var DETAIL_MESSAGE_LIMIT = 10;
 var ENRICH_CONCURRENCY = 4;
+var HYDRATE_CONCURRENCY = 4;
+// Kept equal to MAX_SERVERS so the host list is always one batch. Laptops sleep,
+// and a sleeping host costs a full timeout; batching would make hosts wait
+// behind that instead of alongside it.
+var SERVER_CONCURRENCY = 6;
 var MAX_APP_MESSAGE_FAILURES = 8;
-var BUILD_LABEL = "v0.1.0";
+var BUILD_LABEL = "v0.3.0";
 var DEFAULT_BASE_URL = "";
-var DEFAULT_USERNAME = "t3code";
-var DEFAULT_PASSWORD = "";
-var T3_GET_SNAPSHOT = "orchestration.getSnapshot";
-var T3_DISPATCH_COMMAND = "orchestration.dispatchCommand";
-var PEBBLE_CODEX_MODEL_FALLBACK = "gpt-5.5";
+var DEFAULT_TOKEN = "";
+var HTTP_TIMEOUT_MS = 20000;
+// The host list is one cheap request per machine, so it does not need the full
+// budget. A shorter ceiling keeps a sleeping laptop from stalling the first
+// paint for every other host.
+var HOST_PROBE_TIMEOUT_MS = 8000;
+var MAX_SERVERS = 6;
+// Thread and project ids are namespaced by server so every id the watch sends
+// back can be routed to the machine it came from. SessionItem.id is 72 bytes
+// on the watch, so the prefix is kept short.
+var ID_SEPARATOR = "::";
+// Mainline T3 Code serves orchestration reads over REST instead of the old
+// `orchestration.getSnapshot` RPC. The snapshot route is cheap but returns
+// threads with empty bodies, so thread detail is fetched per thread.
+// The shell route carries hasPendingApprovals / hasPendingUserInput /
+// settledOverride / latestUserMessageAt, which is everything the settled
+// classification needs. One request per host, no per-thread hydration.
+var T3_SHELL_PATH = "/api/orchestration/shell";
+var T3_THREAD_PATH = "/api/orchestration/threads/";
+var T3_DISPATCH_PATH = "/api/orchestration/dispatch";
+var T3_SOURCE_LABEL = "t3 http";
+// Turn windows requested when hydrating thread bodies. The list only needs
+// enough turns to recover a status badge and a summary line; the transcript
+// view asks for a much deeper window.
+var LIST_TURN_LIMIT = 6;
+var CONTEXT_TURN_LIMIT = 40;
+// New threads inherit whatever the project's default is on the server. This
+// is only used when a project carries no default at all.
+var FALLBACK_MODEL_SELECTION = { instanceId: "codex", model: "gpt-5.6-sol" };
 var DEFAULT_SETTINGS = {
-  baseUrl: DEFAULT_BASE_URL,
-  username: DEFAULT_USERNAME,
-  password: DEFAULT_PASSWORD
+  servers: [],
+  nextServerId: 1
 };
 
 var appMessageQueue = [];
@@ -54,6 +94,8 @@ var runtimeStatusBySession = {};
 var cachedSessions = {};
 var cachedProjects = {};
 var lastSnapshot = null;
+var lastSnapshotFailures = [];
+var shellByServer = {};
 
 function settings() {
   migrateSettings();
@@ -62,15 +104,56 @@ function settings() {
     return copySettings(DEFAULT_SETTINGS);
   }
   try {
-    var parsed = JSON.parse(raw);
-    return {
-      baseUrl: normalizeBaseUrl(parsed.baseUrl),
-      username: trim(parsed.username || DEFAULT_USERNAME),
-      password: parsed.password || DEFAULT_PASSWORD
-    };
+    return normalizeSettings(JSON.parse(raw));
   } catch (e) {
     return copySettings(DEFAULT_SETTINGS);
   }
+}
+
+function normalizeSettings(parsed) {
+  var servers = [];
+  var source = (parsed && parsed.servers) || [];
+  var nextId = parseInt(parsed && parsed.nextServerId, 10);
+  if (isNaN(nextId) || nextId < 1) {
+    nextId = 1;
+  }
+  for (var i = 0; i < source.length && servers.length < MAX_SERVERS; i++) {
+    var server = normalizeServer(source[i]);
+    if (!server.baseUrl) {
+      continue;
+    }
+    if (!server.id) {
+      server.id = "s" + nextId;
+      nextId++;
+    }
+    servers.push(server);
+  }
+  // Ids must never collide, or the watch would route a reply to the wrong
+  // machine. A duplicate arriving from edited settings gets a fresh id.
+  var seen = {};
+  for (var j = 0; j < servers.length; j++) {
+    if (seen[servers[j].id]) {
+      servers[j].id = "s" + nextId;
+      nextId++;
+    }
+    seen[servers[j].id] = true;
+    var used = parseInt(String(servers[j].id).replace(/^s/, ""), 10);
+    if (!isNaN(used) && used >= nextId) {
+      nextId = used + 1;
+    }
+  }
+  return { servers: servers, nextServerId: nextId };
+}
+
+function normalizeServer(server) {
+  server = server || {};
+  var baseUrl = normalizeBaseUrl(server.baseUrl);
+  return {
+    id: trim(server.id),
+    label: compact(trim(server.label) || hostShortName(baseUrl), 18),
+    baseUrl: baseUrl,
+    token: trim(server.token || DEFAULT_TOKEN)
+  };
 }
 
 function migrateSettings() {
@@ -78,37 +161,78 @@ function migrateSettings() {
     return;
   }
   var raw = localStorage.getItem("t3pebble_settings");
-  var shouldReset = !raw;
+  var migrated = null;
   if (raw) {
     try {
       var parsed = JSON.parse(raw);
-      var baseUrl = trim(parsed.baseUrl || "");
-      shouldReset = !baseUrl || /^https?:\/\/wills-macbook-pro-5(?::4096)?\/?$/i.test(baseUrl);
+      if (parsed && parsed.servers) {
+        migrated = normalizeSettings(parsed);
+      } else {
+        // Single-server builds stored one `{baseUrl, token}` pair. Promote it
+        // to the first entry of the server list so nothing has to be retyped.
+        var baseUrl = trim(parsed && parsed.baseUrl);
+        if (baseUrl && !/^https?:\/\/wills-macbook-pro-5(?::4096)?\/?$/i.test(baseUrl)) {
+          migrated = normalizeSettings({
+            servers: [{ label: "", baseUrl: baseUrl, token: trim(parsed.token || "") }]
+          });
+        }
+      }
     } catch (e) {
-      shouldReset = true;
+      migrated = null;
     }
   }
   localStorage.setItem("t3pebble_build_label", BUILD_LABEL);
-  if (shouldReset) {
-    localStorage.setItem("t3pebble_settings", JSON.stringify(DEFAULT_SETTINGS));
-  }
+  localStorage.setItem("t3pebble_settings", JSON.stringify(migrated || DEFAULT_SETTINGS));
 }
 
 function copySettings(source) {
-  return {
-    baseUrl: source.baseUrl,
-    username: source.username,
-    password: source.password
-  };
+  return normalizeSettings(source);
 }
 
 function saveSettings(next) {
-  localStorage.setItem("t3pebble_settings", JSON.stringify({
-    baseUrl: normalizeBaseUrl(next.baseUrl),
-    username: trim(next.username || DEFAULT_USERNAME),
-    password: next.password || DEFAULT_PASSWORD
-  }));
+  // The settings page round-trips ids but not the counter, so carry the old
+  // floor forward. Reusing the id of a removed server would let a stale watch
+  // id resolve to a different machine.
+  var previous = 1;
+  try {
+    previous = parseInt(JSON.parse(localStorage.getItem("t3pebble_settings")).nextServerId, 10) || 1;
+  } catch (e) {
+    previous = 1;
+  }
+  var normalized = normalizeSettings({
+    servers: (next && next.servers) || [],
+    nextServerId: previous
+  });
+  localStorage.setItem("t3pebble_settings", JSON.stringify(normalized));
 }
+
+function configuredServers() {
+  return settings().servers;
+}
+
+function serverById(serverId) {
+  var servers = configuredServers();
+  for (var i = 0; i < servers.length; i++) {
+    if (servers[i].id === serverId) {
+      return servers[i];
+    }
+  }
+  return null;
+}
+
+function compositeId(serverId, nativeId) {
+  return serverId + ID_SEPARATOR + nativeId;
+}
+
+function splitCompositeId(value) {
+  var raw = String(value || "");
+  var at = raw.indexOf(ID_SEPARATOR);
+  if (at === -1) {
+    return { serverId: "", nativeId: raw };
+  }
+  return { serverId: raw.slice(0, at), nativeId: raw.slice(at + ID_SEPARATOR.length) };
+}
+
 
 function trim(value) {
   return String(value || "").replace(/^\s+|\s+$/g, "");
@@ -141,27 +265,7 @@ function compactTail(value, limit) {
   return "..." + value.slice(value.length - limit + 3);
 }
 
-function compactLine(value, limit) {
-  value = String(value || "").replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
-  if (value.length <= limit) {
-    return value;
-  }
-  if (limit <= 3) {
-    return value.slice(0, limit);
-  }
-  return value.slice(0, limit - 3) + "...";
-}
 
-function compactMultilineTail(value, limit) {
-  value = String(value || "").replace(/\r/g, "").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/^\s+|\s+$/g, "");
-  if (value.length <= limit) {
-    return value;
-  }
-  if (limit <= 3) {
-    return value.slice(value.length - limit);
-  }
-  return "...\n" + value.slice(value.length - limit + 4).replace(/^\s+/, "");
-}
 
 function utf8Length(value) {
   value = String(value || "");
@@ -171,9 +275,6 @@ function utf8Length(value) {
   return unescape(encodeURIComponent(value)).length;
 }
 
-function trimToUtf8Bytes(value, byteLimit) {
-  return trimToUtf8BytesWithIndex(value, byteLimit).text;
-}
 
 function trimToUtf8BytesWithIndex(value, byteLimit) {
   value = String(value || "");
@@ -238,15 +339,6 @@ function transcriptText(value) {
     .replace(/^\s+|\s+$/g, "");
 }
 
-function responseList(response) {
-  if (response && response.data && response.data.length !== undefined) {
-    return response.data;
-  }
-  if (response && response.length !== undefined) {
-    return response;
-  }
-  return [];
-}
 
 function fiveSentences(value) {
   value = String(value || "").replace(/\s+/g, " ");
@@ -263,21 +355,13 @@ function fileName(path) {
   return parts[parts.length - 1] || path || "project";
 }
 
-function sessionDirectory(session) {
-  return (session && session.fullDirectory) || (session && session.location && (session.location.directory || session.location.path)) || (session && session.directory) || "";
-}
 
-function wsUrl(config) {
-  var baseUrl = normalizeBaseUrl(config.baseUrl);
+function httpUrl(server, path) {
+  var baseUrl = normalizeBaseUrl(server.baseUrl);
   if (!baseUrl) {
     return "";
   }
-  var url = baseUrl.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:");
-  url = url.replace(/\/+$/, "") + "/ws";
-  if (config.password) {
-    url += (url.indexOf("?") === -1 ? "?" : "&") + "token=" + encodeURIComponent(config.password);
-  }
-  return url;
+  return baseUrl + path;
 }
 
 function randomId(prefix) {
@@ -285,131 +369,222 @@ function randomId(prefix) {
   return prefix + Date.now().toString(36) + random;
 }
 
-function rpcRequestId() {
-  return String(Date.now()) + String(Math.floor(Math.random() * 1000000));
-}
-
-function rpcHexId(length) {
-  var value = "";
-  while (value.length < length) {
-    value += Math.floor(Math.random() * 0x100000000).toString(16);
-  }
-  return value.slice(0, length);
-}
-
-function rpcRequest(method, payload, callback) {
-  var config = settings();
-  if (!config.baseUrl) {
+function httpRequest(server, method, path, body, callback, timeoutMs) {
+  if (!server || !server.baseUrl) {
     callback(new Error("Configure remote URL"));
     return;
   }
-  if (typeof WebSocket === "undefined") {
-    callback(new Error("Phone WebSocket unavailable"));
+  if (!server.token) {
+    callback(new Error("Add an access token for " + (server.label || "this server")));
+    return;
+  }
+  if (typeof XMLHttpRequest === "undefined") {
+    callback(new Error("Phone HTTP unavailable"));
     return;
   }
 
-  var socket = null;
-  var requestId = rpcRequestId();
   var done = false;
-  function finish(error, response) {
+  var request = new XMLHttpRequest();
+
+  function finish(error, value) {
     if (done) {
       return;
     }
     done = true;
     clearTimeout(timer);
-    try {
-      if (socket) {
-        socket.close();
-      }
-    } catch (e) {
-      void e;
-    }
-    callback(error, response);
+    callback(error, value);
   }
 
   var timer = setTimeout(function() {
-    finish(new Error("T3 WebSocket timeout"));
-  }, 20000);
-
-  function handleMessage(event) {
-    var raw = event && event.data !== undefined ? event.data : event;
-    var message = null;
     try {
-      message = JSON.parse(raw);
+      request.abort();
     } catch (e) {
+      void e;
+    }
+    finish(new Error("T3 request timeout"));
+  }, timeoutMs || HTTP_TIMEOUT_MS);
+
+  request.onreadystatechange = function() {
+    if (request.readyState !== 4 || done) {
       return;
     }
-    if (!message || message.requestId !== requestId || message._tag !== "Exit") {
+    var status = request.status;
+    if (!status) {
+      finish(new Error("T3 unreachable"));
       return;
     }
-    var exit = message.exit || {};
-    if (exit._tag === "Success") {
-      finish(null, exit.value);
+    if (status < 200 || status >= 300) {
+      finish(new Error(httpFailureMessage(status, request.responseText)));
       return;
     }
-    finish(new Error(rpcFailureMessage(exit)));
-  }
+    var text = trim(request.responseText);
+    if (!text) {
+      finish(null, null);
+      return;
+    }
+    try {
+      finish(null, JSON.parse(text));
+    } catch (e) {
+      finish(new Error("T3 sent an unreadable response"));
+    }
+  };
 
   try {
-    socket = new WebSocket(wsUrl(config));
+    request.open(method, httpUrl(server, path), true);
+    request.setRequestHeader("Authorization", "Bearer " + server.token);
+    request.setRequestHeader("Accept", "application/json");
+    if (body !== null && body !== undefined) {
+      request.setRequestHeader("Content-Type", "application/json");
+    }
+    request.send(body === null || body === undefined ? null : JSON.stringify(body));
   } catch (e) {
     finish(e);
+  }
+}
+
+function httpFailureMessage(status, responseText) {
+  var detail = "";
+  try {
+    var parsed = JSON.parse(responseText || "");
+    if (parsed && typeof parsed === "object") {
+      detail = parsed.reason || parsed.requiredScope || parsed.code || parsed._tag || "";
+    }
+  } catch (e) {
+    void e;
+  }
+  if (status === 401) {
+    return "T3 rejected the access token" + (detail ? " (" + detail + ")" : "");
+  }
+  if (status === 403) {
+    return "Access token is missing a scope" + (detail ? " (" + detail + ")" : "");
+  }
+  if (status === 404) {
+    return detail === "thread_not_found" ? "Thread not found" : "T3 route not found";
+  }
+  return "T3 request failed (" + status + (detail ? " " + detail : "") + ")";
+}
+
+// Fans out across every configured server and folds the replies into one
+// snapshot shaped exactly like the single-server one, with ids namespaced by
+// server. Everything downstream stays server-agnostic.
+
+// Rewrites every id in one server's snapshot into the namespaced form and
+// records which server it came from.
+function tagSnapshot(server, snapshot) {
+  var multiple = configuredServers().length > 1;
+  var label = multiple ? server.label : "";
+  var projects = ((snapshot && snapshot.projects) || []).map(function(project) {
+    var tagged = copyThread(project);
+    tagged.id = compositeId(server.id, project.id);
+    tagged.nativeId = project.id;
+    tagged.serverId = server.id;
+    tagged.serverLabel = label;
+    return tagged;
+  });
+  var threads = ((snapshot && snapshot.threads) || []).map(function(thread) {
+    return tagThread(server, label, thread);
+  });
+  return { projects: projects, threads: threads };
+}
+
+function tagThread(server, label, thread) {
+  var tagged = copyThread(thread);
+  tagged.id = compositeId(server.id, thread.id);
+  tagged.nativeId = thread.id;
+  tagged.projectId = compositeId(server.id, thread.projectId);
+  tagged.nativeProjectId = thread.projectId;
+  tagged.serverId = server.id;
+  tagged.serverLabel = label;
+  return tagged;
+}
+
+
+
+function copyThread(thread) {
+  var copy = {};
+  for (var key in thread) {
+    if (thread.hasOwnProperty(key)) {
+      copy[key] = thread[key];
+    }
+  }
+  return copy;
+}
+
+function storeHydratedThread(thread) {
+  if (!lastSnapshot || !thread) {
     return;
   }
-
-  socket.onopen = function() {
-    socket.send(JSON.stringify({
-      _tag: "Request",
-      id: requestId,
-      tag: method,
-      payload: payload || {},
-      traceId: rpcHexId(32),
-      spanId: rpcHexId(16),
-      sampled: true,
-      headers: []
-    }));
-  };
-  socket.onmessage = handleMessage;
-  socket.onerror = function() {
-    finish(new Error("T3 WebSocket error"));
-  };
-  socket.onclose = function() {
-    if (!done) {
-      finish(new Error("T3 WebSocket closed"));
+  var threads = lastSnapshot.threads || [];
+  for (var i = 0; i < threads.length; i++) {
+    if (threads[i].id === thread.id) {
+      threads[i] = thread;
+      lastSnapshot.threads = threads;
+      return;
     }
-  };
-  if (socket.addEventListener) {
-    socket.addEventListener("message", handleMessage);
   }
+  lastSnapshot.threads = threads.concat([thread]);
 }
 
-function rpcFailureMessage(exit) {
-  if (!exit) {
-    return "T3 request failed";
+function fetchThreadDetail(compositeThreadId, turnLimit, callback) {
+  var parts = splitCompositeId(compositeThreadId);
+  var server = serverById(parts.serverId);
+  if (!server) {
+    callback(new Error("Unknown T3 server"));
+    return;
   }
-  if (exit.cause && exit.cause.pretty) {
-    return exit.cause.pretty;
-  }
-  if (exit.cause && exit.cause.message) {
-    return exit.cause.message;
-  }
-  if (exit.error && exit.error.message) {
-    return exit.error.message;
-  }
-  return "T3 request failed";
-}
-
-function getSnapshot(callback) {
-  rpcRequest(T3_GET_SNAPSHOT, {}, function(error, snapshot) {
-    if (!error) {
-      lastSnapshot = snapshot;
+  var multiple = configuredServers().length > 1;
+  var path = T3_THREAD_PATH + encodeURIComponent(parts.nativeId) + "?turnLimit=" + turnLimit;
+  httpRequest(server, "GET", path, null, function(error, response) {
+    if (error) {
+      callback(error);
+      return;
     }
-    callback(error, snapshot);
+    var thread = response && response.thread;
+    if (!thread) {
+      callback(new Error("Thread not found"));
+      return;
+    }
+    var hydrated = tagThread(server, multiple ? server.label : "", thread);
+    hydrated.hydratedTurns = turnLimit;
+    callback(null, hydrated);
   });
 }
 
-function dispatchCommand(command, callback) {
-  rpcRequest(T3_DISPATCH_COMMAND, command, callback);
+function ensureThreadHydrated(threadId, turnLimit, callback) {
+  var cached = lastSnapshot ? threadById(lastSnapshot, threadId) : null;
+  if (cached && cached.hydratedTurns >= turnLimit) {
+    callback(null, cached);
+    return;
+  }
+  refreshThread(threadId, turnLimit, callback);
+}
+
+function refreshThread(threadId, turnLimit, callback) {
+  fetchThreadDetail(threadId, turnLimit, function(error, thread) {
+    if (error) {
+      callback(error);
+      return;
+    }
+    storeHydratedThread(thread);
+    callback(null, thread);
+  });
+}
+
+
+function dispatchCommand(server, command, callback) {
+  httpRequest(server, "POST", T3_DISPATCH_PATH, command, callback);
+}
+
+// Resolves the server that owns a namespaced thread id, then hands the builder
+// the plain thread id that server expects to see.
+function dispatchForThread(compositeThreadId, build, callback) {
+  var parts = splitCompositeId(compositeThreadId);
+  var server = serverById(parts.serverId);
+  if (!server) {
+    callback(new Error("Unknown T3 server"));
+    return;
+  }
+  dispatchCommand(server, build(parts.nativeId), callback);
 }
 
 function send(message) {
@@ -471,22 +646,213 @@ function makeMessage(command, fields) {
   if (fields.requestKind !== undefined) message[KEY_REQUEST_KIND] = fields.requestKind;
   if (fields.projectId !== undefined) message[KEY_PROJECT_ID] = fields.projectId;
   if (fields.contextPage !== undefined) message[KEY_CONTEXT_PAGE] = fields.contextPage;
+  if (fields.server !== undefined) message[KEY_SERVER] = fields.server;
+  if (fields.state !== undefined) message[KEY_STATE] = fields.state;
+  if (fields.hostId !== undefined) message[KEY_HOST_ID] = fields.hostId;
+  if (fields.detail !== undefined) message[KEY_DETAIL] = fields.detail;
+  if (fields.counts !== undefined) {
+    message[KEY_C_NEEDS] = fields.counts.needs;
+    message[KEY_C_RUN] = fields.counts.run;
+    message[KEY_C_IDLE] = fields.counts.idle;
+    message[KEY_C_SETTLED] = fields.counts.settled;
+  }
   return message;
 }
 
-function projectById(snapshot) {
-  var map = {};
-  var projects = snapshot && snapshot.projects ? snapshot.projects : [];
-  for (var i = 0; i < projects.length; i++) {
-    map[projects[i].id] = projects[i];
-  }
-  return map;
-}
 
 function newestFirst(values) {
   return values.slice().sort(function(left, right) {
     return (Date.parse(right.updatedAt || right.createdAt || "") || 0) - (Date.parse(left.updatedAt || left.createdAt || "") || 0);
   });
+}
+
+// --- thread lifecycle -------------------------------------------------
+// Ported from T3 Code's own threadSettled.ts so the watch never disagrees
+// with the desktop about what is settled. Keep the ordering: activity
+// blockers are checked before any override, exactly as effectiveSettled does.
+
+var QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1000;
+var AUTO_SETTLE_AFTER_DAYS = 3; // T3's DEFAULT_SIDEBAR_AUTO_SETTLE_AFTER_DAYS
+var DAY_MS = 24 * 60 * 60 * 1000;
+
+function parseTime(value) {
+  if (!value) {
+    return NaN;
+  }
+  return Date.parse(value);
+}
+
+// A user message no turn has adopted yet: dispatched but not yet picked up,
+// so session is still null and the pending work is invisible to the status
+// checks. Only counts inside the adoption grace window.
+function hasQueuedTurnStart(thread, nowMs) {
+  if (!thread.latestUserMessageAt) {
+    return false;
+  }
+  if (thread.session && thread.session.status === "error") {
+    return false;
+  }
+  var messageAt = parseTime(thread.latestUserMessageAt);
+  if (isNaN(messageAt) || isNaN(nowMs)) {
+    return false;
+  }
+  if (Math.abs(nowMs - messageAt) > QUEUED_TURN_START_GRACE_MS) {
+    return false;
+  }
+  var turn = thread.latestTurn;
+  if (!turn) {
+    return true;
+  }
+  var stamps = [turn.requestedAt, turn.startedAt, turn.completedAt];
+  for (var i = 0; i < stamps.length; i++) {
+    if (stamps[i] && parseTime(stamps[i]) >= messageAt) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function threadLastActivityAt(thread) {
+  var turn = thread.latestTurn || {};
+  var candidates = [thread.latestUserMessageAt, turn.requestedAt, turn.startedAt, turn.completedAt];
+  var latest = null;
+  var latestMs = -Infinity;
+  for (var i = 0; i < candidates.length; i++) {
+    if (!candidates[i]) {
+      continue;
+    }
+    var ms = parseTime(candidates[i]);
+    if (ms > latestMs) {
+      latest = candidates[i];
+      latestMs = ms;
+    }
+  }
+  return latest;
+}
+
+function threadRaisedHandWhileSnoozed(thread) {
+  if (thread.hasPendingApprovals || thread.hasPendingUserInput) {
+    return true;
+  }
+  var session = thread.session;
+  if (session && session.status === "error" &&
+      (!thread.snoozedAt || parseTime(session.updatedAt) > parseTime(thread.snoozedAt))) {
+    return true;
+  }
+  var turn = thread.latestTurn;
+  if (thread.snoozedAt && turn && turn.state === "completed" && turn.completedAt &&
+      parseTime(turn.completedAt) > parseTime(thread.snoozedAt)) {
+    return true;
+  }
+  return false;
+}
+
+function effectiveSnoozed(thread, nowMs) {
+  if (!thread.snoozedUntil) {
+    return false;
+  }
+  var wakeAt = parseTime(thread.snoozedUntil);
+  if (isNaN(wakeAt) || wakeAt <= nowMs) {
+    return false;
+  }
+  return !threadRaisedHandWhileSnoozed(thread);
+}
+
+function effectiveSettled(thread, nowMs) {
+  if (thread.hasPendingApprovals || thread.hasPendingUserInput) {
+    return false;
+  }
+  var status = thread.session && thread.session.status;
+  if (status === "starting" || status === "running") {
+    return false;
+  }
+  if (hasQueuedTurnStart(thread, nowMs)) {
+    // The queued blocker is forgivable when the server already adjudicated it
+    // by accepting a settle after the message.
+    var adjudicated = thread.settledOverride === "settled" && thread.settledAt &&
+      thread.latestUserMessageAt &&
+      parseTime(thread.settledAt) >= parseTime(thread.latestUserMessageAt);
+    if (!adjudicated) {
+      return false;
+    }
+  }
+  if (thread.settledOverride === "settled") {
+    return true;
+  }
+  if (thread.settledOverride === "active") {
+    return false;
+  }
+  if (AUTO_SETTLE_AFTER_DAYS === null) {
+    return false;
+  }
+  var lastActivityAt = threadLastActivityAt(thread);
+  if (!lastActivityAt) {
+    return false;
+  }
+  return parseTime(lastActivityAt) < nowMs - AUTO_SETTLE_AFTER_DAYS * DAY_MS;
+}
+
+function threadState(thread, nowMs) {
+  if (thread.hasPendingApprovals || thread.hasPendingUserInput) {
+    return "needs";
+  }
+  var status = thread.session && thread.session.status;
+  if (status === "starting" || status === "running" || thread.backgroundLiveness === "working" ||
+      hasQueuedTurnStart(thread, nowMs)) {
+    return "run";
+  }
+  if (effectiveSettled(thread, nowMs)) {
+    return "settled";
+  }
+  if (effectiveSnoozed(thread, nowMs)) {
+    return "snooze";
+  }
+  if (status === "error" || (thread.latestTurn && thread.latestTurn.state === "error")) {
+    return "err";
+  }
+  return "idle";
+}
+
+function relativeAge(iso, nowMs) {
+  var ms = parseTime(iso);
+  if (isNaN(ms)) {
+    return "";
+  }
+  var delta = nowMs - ms;
+  if (delta < 60000) {
+    return "now";
+  }
+  if (delta < 3600000) {
+    return Math.round(delta / 60000) + "m";
+  }
+  if (delta < DAY_MS) {
+    return Math.round(delta / 3600000) + "h";
+  }
+  return Math.round(delta / DAY_MS) + "d";
+}
+
+function threadDetailLine(thread, state, nowMs) {
+  if (state === "needs") {
+    return thread.hasPendingApprovals ? "needs approval" : "needs an answer";
+  }
+  if (state === "run") {
+    var progress = thread.planProgress;
+    if (progress && progress.step) {
+      return compact(progress.step, 34);
+    }
+    return "running";
+  }
+  if (state === "err") {
+    return "error";
+  }
+  if (state === "snooze") {
+    return "snoozed " + relativeAge(thread.snoozedUntil, nowMs);
+  }
+  var age = relativeAge(threadLastActivityAt(thread) || thread.updatedAt, nowMs);
+  if (state === "settled") {
+    return age ? "settled " + age : "settled";
+  }
+  return age ? "idle " + age : "idle";
 }
 
 function activeThreads(snapshot) {
@@ -513,33 +879,29 @@ function threadById(snapshot, threadId) {
   return null;
 }
 
-function projectForThread(snapshot, thread) {
-  return projectById(snapshot)[thread.projectId] || null;
-}
 
 function projectTitle(project) {
   return compact((project && project.title) || fileName(project && project.workspaceRoot) || "Project", 58);
 }
 
-function threadDirectory(snapshot, thread) {
-  var project = projectForThread(snapshot, thread);
-  return thread.worktreePath || (project && project.workspaceRoot) || "";
-}
 
-function modelSelection(selection) {
-  if (!selection) {
-    return { instanceId: "codex", provider: "codex", model: PEBBLE_CODEX_MODEL_FALLBACK };
-  }
-  var provider = selection.provider || selection.instanceId;
-  if (provider === "codex") {
+// The watch does not pick models. Whatever the server has configured wins;
+// the fallback only covers a project that carries no default at all.
+function resolveModelSelection(selection) {
+  if (!selection || !trim(selection.model)) {
     return {
-      instanceId: "codex",
-      provider: "codex",
-      model: PEBBLE_CODEX_MODEL_FALLBACK,
-      options: selection.options
+      instanceId: FALLBACK_MODEL_SELECTION.instanceId,
+      model: FALLBACK_MODEL_SELECTION.model
     };
   }
-  return selection;
+  var resolved = {
+    instanceId: selection.instanceId || selection.provider,
+    model: selection.model
+  };
+  if (selection.options !== undefined) {
+    resolved.options = selection.options;
+  }
+  return resolved;
 }
 
 function activityPayload(activity) {
@@ -713,83 +1075,17 @@ function parseJsonErrorMessage(value) {
   return String(value);
 }
 
-function statusForThread(thread) {
-  if (derivePendingApprovals(thread.activities).length || derivePendingUserInputs(thread.activities).length) {
-    return "Needs input";
-  }
-  if ((thread.session && thread.session.status === "error") || (thread.latestTurn && thread.latestTurn.state === "error")) {
-    return "Error";
-  }
-  if (thread.session && (thread.session.status === "running" || thread.session.status === "starting")) {
-    return "Running";
-  }
-  var messages = newestFirst(thread.messages || []);
-  for (var i = 0; i < messages.length; i++) {
-    if (messages[i].role === "assistant" && !messages[i].streaming && trim(messages[i].text)) {
-      return "Done";
-    }
-  }
-  if (thread.latestTurn && thread.latestTurn.state === "completed") {
-    return "Done";
-  }
-  if (thread.latestTurn && thread.latestTurn.state === "running") {
-    return "Running";
-  }
-  return "Idle";
-}
 
-function sessionSummaryFromThread(thread) {
-  var approval = derivePendingApprovals(thread.activities)[0];
-  if (approval) {
-    return pendingSummary({
-      kind: "permission",
-      request: {
-        permission: approval.requestKind,
-        patterns: approval.detail ? [approval.detail] : []
-      }
-    });
-  }
 
-  var input = derivePendingUserInputs(thread.activities)[0];
-  if (input) {
-    return pendingSummary({
-      kind: "question",
-      request: input
-    });
-  }
-
-  var errorDetail = latestErrorDetail(thread);
-  if (errorDetail) {
-    return compact("Error: " + errorDetail, SUMMARY_LIMIT);
-  }
-
-  return summaryFromMessages((thread.messages || []).map(toPebbleMessage));
-}
-
-function toPebbleSession(snapshot, thread) {
-  var directory = threadDirectory(snapshot, thread);
-  var approval = derivePendingApprovals(thread.activities)[0];
-  var input = derivePendingUserInputs(thread.activities)[0];
-  return {
-    id: thread.id,
-    title: compact(thread.title || fileName(directory) || "Untitled", 58),
-    directory: compact(directory, 42),
-    fullDirectory: directory,
-    agent: compact((thread.session && thread.session.providerName) || (thread.modelSelection && (thread.modelSelection.provider || thread.modelSelection.instanceId)) || "agent", 20),
-    status: compact(statusForThread(thread), 16),
-    summary: sessionSummaryFromThread(thread),
-    requestId: approval ? approval.requestId : (input ? input.requestId : ""),
-    requestKind: approval ? "permission" : (input ? "question" : "")
-  };
-}
 
 function toPebbleProject(project) {
-  var selection = modelSelection(project.defaultModelSelection);
+  var selection = resolveModelSelection(project.defaultModelSelection);
   return {
     id: project.id,
     title: projectTitle(project),
     directory: project.workspaceRoot || "",
-    model: selection.model || "codex"
+    model: selection.model || "codex",
+    server: project.serverLabel || ""
   };
 }
 
@@ -809,66 +1105,167 @@ function toPebbleMessage(message) {
   };
 }
 
-function refreshSessions() {
-  pendingBySession = {};
-  runtimeStatusBySession = {};
-  sendStatus(BUILD_LABEL + " " + urlHost(settings().baseUrl));
-  listSessions(function(error, sessions, source, diagnostic) {
+// --- host roll-up -----------------------------------------------------
+// The home screen answers one question per machine: does anything there want
+// me? Everything it needs comes from the single shell request per host.
+
+function rollupForThreads(threads, nowMs) {
+  var counts = { needs: 0, run: 0, err: 0, idle: 0, settled: 0, snooze: 0 };
+  for (var i = 0; i < threads.length; i++) {
+    var state = threadState(threads[i], nowMs);
+    counts[state] = (counts[state] || 0) + 1;
+  }
+  counts.total = threads.length;
+  return counts;
+}
+
+function hostStateFromCounts(counts) {
+  if (counts.needs > 0) return "needs";
+  if (counts.run > 0) return "run";
+  if (counts.err > 0) return "err";
+  if (counts.idle > 0) return "idle";
+  if (counts.total > 0) return "settled";
+  return "empty";
+}
+
+function hostDetailLine(state, counts) {
+  if (state === "needs") return counts.needs + " need you";
+  if (state === "run") return counts.run + " running";
+  if (state === "err") return counts.err + " in error";
+  // "Idle" is the answer to "what needs me to start it": active threads with
+  // nothing actually running.
+  if (state === "idle") return counts.idle + " idle";
+  if (state === "settled") return "all settled";
+  return "no threads";
+}
+
+function refreshHosts() {
+  var servers = configuredServers();
+  if (servers.length === 0) {
+    sendStatus("Add a server");
+    send(makeMessage(CMD_HOST_END, { total: 0 }));
+    return;
+  }
+
+  var nowMs = Date.now();
+  var rows = new Array(servers.length);
+  eachLimit(servers, SERVER_CONCURRENCY, function(server, index, next) {
+    httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
+      if (error) {
+        shellByServer[server.id] = null;
+        rows[index] = {
+          id: server.id,
+          title: server.label,
+          state: "offline",
+          detail: compact(String(error.message || error), 34),
+          counts: { needs: 0, run: 0, idle: 0, settled: 0 }
+        };
+        next();
+        return;
+      }
+      shellByServer[server.id] = tagSnapshot(server, snapshot);
+      var threads = activeThreads(shellByServer[server.id]);
+      var counts = rollupForThreads(threads, nowMs);
+      var state = hostStateFromCounts(counts);
+      rows[index] = {
+        id: server.id,
+        title: server.label,
+        state: state,
+        detail: hostDetailLine(state, counts),
+        counts: {
+          needs: counts.needs,
+          run: counts.run,
+          idle: counts.idle + counts.err,
+          settled: counts.settled + counts.snooze
+        }
+      };
+      next();
+    }, HOST_PROBE_TIMEOUT_MS);
+  }, function() {
+    for (var i = 0; i < rows.length; i++) {
+      send(makeMessage(CMD_HOST_ITEM, {
+        index: i,
+        total: rows.length,
+        hostId: rows[i].id,
+        title: rows[i].title,
+        detail: rows[i].detail,
+        state: rows[i].state,
+        counts: rows[i].counts
+      }));
+    }
+    send(makeMessage(CMD_HOST_END, { total: rows.length }));
+  });
+}
+
+// --- one host's threads -----------------------------------------------
+
+function selectHost(hostId) {
+  var server = serverById(hostId);
+  if (!server) {
+    sendError("Unknown host");
+    send(makeMessage(CMD_SESSION_END, { total: 0 }));
+    return;
+  }
+
+  function emit(tagged) {
+    lastSnapshot = tagged;
+    var nowMs = Date.now();
+    var threads = activeThreads(tagged);
+    sendSessionItems(threads.map(function(thread) {
+      var state = threadState(thread, nowMs);
+      return {
+        id: thread.id,
+        title: compact(thread.title || "Untitled", 54),
+        detail: threadDetailLine(thread, state, nowMs),
+        state: state,
+        summary: "",
+        requestId: "",
+        requestKind: state === "needs" ? (thread.hasPendingApprovals ? "permission" : "question") : ""
+      };
+    }));
+    sendProjectItems(activeProjects(tagged).map(toPebbleProject));
+  }
+
+  var cached = shellByServer[hostId];
+  if (cached) {
+    emit(cached);
+    return;
+  }
+  httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
     if (error) {
       sendError(error);
-      return;
-    }
-
-    sessions = sessions.slice(0, MAX_SESSIONS);
-    sendStatus(sessionCountStatus(sessions.length, source));
-    if (sessions.length === 0) {
-      cachedSessions = {};
       send(makeMessage(CMD_SESSION_END, { total: 0 }));
-      refreshProjects();
-      if (diagnostic) {
-        sendStatus(diagnostic);
-      }
       return;
     }
-
-    if (Object.keys(cachedSessions).length === 0) {
-      sendSessionItems(sessions.map(function(session) {
-        return toQuickItem(session);
-      }));
-    } else {
-      send(makeMessage(CMD_SESSION_END, { total: sessions.length }));
-    }
-
-    loadRuntimeStatusForSessions(sessions, function() {
-      loadPendingForSessions(sessions, function() {
-        loadSessionSummaries(sessions, 0, function(items) {
-          sendSessionItems(items);
-          refreshProjects();
-        });
-      });
-    });
+    shellByServer[hostId] = tagSnapshot(server, snapshot);
+    emit(shellByServer[hostId]);
   });
 }
 
-function sessionCountStatus(count, source) {
-  return "Found " + count + " session" + (count === 1 ? "" : "s") + (source ? " via " + source : "");
-}
-
-function listSessions(callback) {
-  getSnapshot(function(error, snapshot) {
-    if (error) {
-      callback(error);
-      return;
-    }
-    var sessions = activeThreads(snapshot).map(function(thread) {
-      return toPebbleSession(snapshot, thread);
-    });
-    callback(null, sessions, "t3 ws", "t3 ws " + sessions.length);
-  });
-}
 
 function urlHost(url) {
   return String(url || "").replace(/^https?:\/\//i, "").replace(/\/.*$/, "") || "no URL";
+}
+
+// Label shown when the settings entry leaves Label blank. Tailnet hosts are
+// `machine.tailnet.ts.net`, and the shared suffix is the part that would get
+// truncated away at 18 characters, so keep the leading segment only. An IP has
+// no such segment, so it stays whole and keeps its port.
+function hostShortName(url) {
+  var host = urlHost(url);
+  var portMatch = host.match(/:\d+$/);
+  var port = portMatch ? portMatch[0] : "";
+  var withoutPort = port ? host.slice(0, host.length - port.length) : host;
+  // Only the shared DNS suffix is dropped. A port distinguishes one host from
+  // another, so it is always kept, and an IP has no suffix worth trimming.
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(withoutPort)) {
+    return host;
+  }
+  var dot = withoutPort.indexOf(".");
+  if (dot === -1) {
+    return host;
+  }
+  return withoutPort.slice(0, dot) + port;
 }
 
 function eachLimit(items, limit, worker, done) {
@@ -909,13 +1306,6 @@ function sendSessionItems(items) {
   send(makeMessage(CMD_SESSION_END, { total: items.length }));
 }
 
-function refreshProjects() {
-  if (!lastSnapshot) {
-    send(makeMessage(CMD_PROJECT_END, { total: 0 }));
-    return;
-  }
-  sendProjectItems(activeProjects(lastSnapshot).map(toPebbleProject));
-}
 
 function sendProjectItems(items) {
   cachedProjects = {};
@@ -927,73 +1317,14 @@ function sendProjectItems(items) {
       projectId: items[i].id,
       title: items[i].title,
       directory: items[i].directory,
-      agent: items[i].model || "codex"
+      agent: items[i].model || "codex",
+      server: items[i].server || ""
     }));
   }
   send(makeMessage(CMD_PROJECT_END, { total: items.length }));
 }
 
-function loadRuntimeStatusForSessions(sessions, callback) {
-  runtimeStatusBySession = {};
-  if (lastSnapshot) {
-    var threads = activeThreads(lastSnapshot);
-    for (var i = 0; i < threads.length; i++) {
-      var status = statusForThread(threads[i]);
-      if (status === "Running") {
-        runtimeStatusBySession[threads[i].id] = { type: "busy" };
-      } else if (status === "Error") {
-        runtimeStatusBySession[threads[i].id] = { type: "error", message: latestErrorDetail(threads[i]) || "Error" };
-      }
-    }
-  }
-  callback();
-}
 
-function loadRuntimeStatusDirectories(directories, callback) {
-  void directories;
-  if (!lastSnapshot) {
-    getSnapshot(function() {
-      loadRuntimeStatusForSessions([], callback);
-    });
-    return;
-  }
-  loadRuntimeStatusForSessions([], callback);
-}
-
-function loadPendingForSessions(sessions, callback) {
-  pendingBySession = {};
-  if (lastSnapshot) {
-    var threads = activeThreads(lastSnapshot);
-    for (var i = 0; i < threads.length; i++) {
-      var approvals = derivePendingApprovals(threads[i].activities);
-      var inputs = derivePendingUserInputs(threads[i].activities);
-      if (approvals.length) {
-        approvals[0].sessionID = threads[i].id;
-        rememberPending(threads[i].id, "permission", approvals[0]);
-      } else if (inputs.length) {
-        inputs[0].sessionID = threads[i].id;
-        rememberPending(threads[i].id, "question", inputs[0]);
-      }
-    }
-  }
-  callback();
-}
-
-function loadPendingDirectories(directories, callback) {
-  void directories;
-  if (!lastSnapshot) {
-    getSnapshot(function() {
-      loadPendingForSessions([], callback);
-    });
-    return;
-  }
-  loadPendingForSessions([], callback);
-}
-
-function loadPending(directory, callback) {
-  void directory;
-  loadPendingForSessions([], callback);
-}
 
 function rememberPending(sessionId, kind, request) {
   if (!sessionId) {
@@ -1006,116 +1337,29 @@ function rememberPending(sessionId, kind, request) {
   };
 }
 
-function loadSessionSummaries(sessions, index, done) {
-  void index;
-  var items = new Array(sessions.length);
-  eachLimit(sessions, ENRICH_CONCURRENCY, function(session, itemIndex, next) {
-    loadSessionItem(session, function(item) {
-      items[itemIndex] = item;
-      next();
-    });
-  }, function() {
-    done(items);
-  });
-}
 
-function loadSessionItem(session, callback) {
-  loadMessages(session.id, 8, sessionDirectory(session), function(error, response) {
-    var messages = error ? [] : responseList(response);
-    callback(toItem(session, messages));
-  });
+
+function turnLimitForMessageLimit(limit) {
+  return limit > DETAIL_MESSAGE_LIMIT ? CONTEXT_TURN_LIMIT : LIST_TURN_LIMIT;
 }
 
 function loadMessages(sessionId, limit, directory, callback) {
   void directory;
-  if (!lastSnapshot) {
-    getSnapshot(function(error) {
-      if (error) {
-        callback(error);
-        return;
-      }
-      loadMessages(sessionId, limit, directory, callback);
-    });
-    return;
-  }
-  var thread = threadById(lastSnapshot, sessionId);
-  if (!thread) {
-    callback(new Error("Thread not found"));
-    return;
-  }
-  var messages = (thread.messages || []).slice().sort(function(left, right) {
-    return messageTime(toPebbleMessage(right)) - messageTime(toPebbleMessage(left));
-  }).slice(0, limit).map(toPebbleMessage);
-  callback(null, messages);
+  ensureThreadHydrated(sessionId, turnLimitForMessageLimit(limit), function(error, thread) {
+    if (error) {
+      callback(error);
+      return;
+    }
+    var messages = (thread.messages || []).slice().sort(function(left, right) {
+      return messageTime(toPebbleMessage(right)) - messageTime(toPebbleMessage(left));
+    }).slice(0, limit).map(toPebbleMessage);
+    callback(null, messages);
+  });
 }
 
-function toQuickItem(session) {
-  var directory = sessionDirectory(session);
-  var title = session.title || fileName(directory) || "Untitled";
-  return {
-    id: session.id,
-    title: compact(title, 58),
-    directory: compact(directory, 42),
-    fullDirectory: directory,
-    agent: compact(session.agent || "agent", 20),
-    status: compact(session.status || "Idle", 16),
-    summary: compact(session.summary || "Awaiting latest signal.", SUMMARY_LIMIT),
-    requestId: session.requestId || "",
-    requestKind: session.requestKind || ""
-  };
-}
 
-function toItem(session, messages) {
-  var pending = pendingBySession[session.id];
-  var runtimeStatus = runtimeStatusBySession[session.id];
-  var status = pending ? "Needs input" : (statusFromRuntimeStatus(runtimeStatus) || session.status || statusFromMessages(messages));
-  var summary = pending ? pendingSummary(pending) : summaryFromMessages(messages);
-  if (!pending && runtimeStatus && summary === "No messages yet.") {
-    summary = summaryFromRuntimeStatus(runtimeStatus);
-  }
-  if (!pending && summary === "No messages yet." && session.summary) {
-    summary = compact(session.summary, SUMMARY_LIMIT);
-  }
-  var directory = sessionDirectory(session);
-  var title = session.title || fileName(directory) || "Untitled";
-  var requestId = pending ? pending.requestId : (session.requestId || "");
-  var requestKind = pending ? pending.kind : (session.requestKind || "");
 
-  return {
-    id: session.id,
-    title: compact(title, 58),
-    directory: compact(directory, 42),
-    fullDirectory: directory,
-    agent: compact(session.agent || "agent", 20),
-    status: compact(status, 16),
-    summary: summary,
-    requestId: requestId,
-    requestKind: requestKind
-  };
-}
 
-function statusFromRuntimeStatus(status) {
-  if (!status) {
-    return "";
-  }
-  if (status.type === "busy" || status.type === "retry") {
-    return "Running";
-  }
-  return "";
-}
-
-function summaryFromRuntimeStatus(status) {
-  if (!status) {
-    return "No messages yet.";
-  }
-  if (status.type === "retry" && status.message) {
-    return compact("Retrying: " + status.message, SUMMARY_LIMIT);
-  }
-  if (status.type === "busy") {
-    return "Agent is running.";
-  }
-  return "No messages yet.";
-}
 
 
 function pendingSummary(pending) {
@@ -1141,41 +1385,12 @@ function pendingSummary(pending) {
   return compact(prefix + first.question + suffix, SUMMARY_LIMIT);
 }
 
-function statusFromMessages(messages) {
-  var sorted = latestFirst(messages);
-  if (sorted.length > 0 && isUserMessage(sorted[0])) {
-    return "Running";
-  }
-  for (var i = 0; i < sorted.length; i++) {
-    var message = sorted[i];
-    var info = messageInfo(message);
-    if (info.role === "assistant" || message.type === "assistant") {
-      if (messageError(message)) {
-        return "Error";
-      }
-      if (!messageFinished(message)) {
-        return "Running";
-      }
-      if (hasActiveTool(message)) {
-        return "Running";
-      }
-      return "Done";
-    }
-  }
-  return "Idle";
-}
 
-function hasActiveTool(message) {
-  var content = messageContent(message);
-  for (var i = 0; i < content.length; i++) {
-    if (content[i].type === "tool" && content[i].state) {
-      var status = content[i].state.status;
-      if (status === "pending" || status === "running") {
-        return true;
-      }
-    }
-  }
-  return false;
+
+function latestFirst(messages) {
+  return messages.slice().sort(function(a, b) {
+    return messageTime(b) - messageTime(a);
+  });
 }
 
 function summaryFromMessages(messages) {
@@ -1204,11 +1419,6 @@ function summaryFromMessages(messages) {
   return "No messages yet.";
 }
 
-function latestFirst(messages) {
-  return messages.slice().sort(function(a, b) {
-    return messageTime(b) - messageTime(a);
-  });
-}
 
 function oldestFirst(messages) {
   return messages.slice().sort(function(a, b) {
@@ -1257,11 +1467,6 @@ function messageError(message) {
   return message.error || info.error;
 }
 
-function messageFinished(message) {
-  var info = messageInfo(message);
-  var time = message.time || info.time || {};
-  return Boolean(time.completed || message.finish || info.finish);
-}
 
 function isUserMessage(message) {
   var info = messageInfo(message);
@@ -1288,41 +1493,85 @@ function itemFields(item, index, total) {
     total: total,
     id: item.id,
     title: item.title,
-    directory: item.directory,
-    agent: item.agent,
-    status: item.status,
-    summary: item.summary,
-    requestId: item.requestId,
-    requestKind: item.requestKind
+    detail: item.detail,
+    state: item.state,
+    summary: item.summary || "",
+    requestId: item.requestId || "",
+    requestKind: item.requestKind || ""
   };
 }
 
 function detail(sessionId, index) {
-  var session = cachedSessions[sessionId] || { id: sessionId };
-  var directory = sessionDirectory(session);
-  loadRuntimeStatusDirectories([directory], function() {
-    loadPending(directory, function() {
-      loadMessages(sessionId, 10, directory, function(error, response) {
-        if (error) {
-          sendError(error);
-          return;
-        }
-        var item = toItem(session, responseList(response));
-        cachedSessions[sessionId] = item;
-        send(makeMessage(CMD_DETAIL, itemFields(item, index, 1)));
-      });
+  // Lifecycle and body come from different routes. hasPendingApprovals,
+  // hasPendingUserInput, latestUserMessageAt and backgroundLiveness exist only
+  // on the shell model, so classifying from the detail thread alone makes the
+  // card disagree with the list it was opened from. State comes from the shell
+  // record; messages come from the detail record.
+  withShellFor(sessionId, function(shellError, shell) {
+    var lifecycle = shellError ? null : threadById(shell, sessionId);
+    refreshThread(sessionId, LIST_TURN_LIMIT, function(error, thread) {
+      if (error) {
+        sendError(error);
+        return;
+      }
+      sendThreadDetail(sessionId, index, lifecycle || thread, thread);
     });
   });
 }
 
+function sendThreadDetail(sessionId, index, lifecycle, thread) {
+  {
+    var nowMs = Date.now();
+    var approval = derivePendingApprovals(thread.activities)[0];
+    var input = derivePendingUserInputs(thread.activities)[0];
+    // Activities are fresher than a cached shell, so a request that landed
+    // since the last roll-up still reads as needing an answer.
+    var state = (approval || input) ? "needs" : threadState(lifecycle, nowMs);
+    var summary;
+    if (approval) {
+      summary = pendingSummary({
+        kind: "permission",
+        request: { permission: approval.requestKind, patterns: approval.detail ? [approval.detail] : [] }
+      });
+    } else if (input) {
+      summary = pendingSummary({ kind: "question", request: input });
+    } else if (state === "err") {
+      summary = compact("Error: " + (latestErrorDetail(thread) || "unknown"), SUMMARY_LIMIT);
+    } else {
+      summary = summaryFromMessages((thread.messages || []).map(toPebbleMessage));
+    }
+
+    if (approval) {
+      approval.sessionID = sessionId;
+      rememberPending(sessionId, "permission", approval);
+    } else if (input) {
+      input.sessionID = sessionId;
+      rememberPending(sessionId, "question", input);
+    } else {
+      delete pendingBySession[sessionId];
+    }
+
+    var item = {
+      id: sessionId,
+      title: compact(thread.title || "Untitled", 54),
+      detail: threadDetailLine(lifecycle, state, nowMs),
+      state: state,
+      summary: summary,
+      requestId: approval ? approval.requestId : (input ? input.requestId : ""),
+      requestKind: approval ? "permission" : (input ? "question" : "")
+    };
+    cachedSessions[sessionId] = item;
+    send(makeMessage(CMD_DETAIL, itemFields(item, index, 1)));
+  }
+}
+
 function context(sessionId, index, page, requestId) {
-  var session = cachedSessions[sessionId] || { id: sessionId };
-  loadMessages(sessionId, CONTEXT_MESSAGE_LIMIT, sessionDirectory(session), function(error, response) {
+  loadMessages(sessionId, CONTEXT_MESSAGE_LIMIT, "", function(error, response) {
     if (error) {
       sendError(error);
       return;
     }
-    var messages = oldestFirst(responseList(response));
+    var messages = oldestFirst(response || []);
     var pages = paginateText(contextFromMessages(messages), CONTEXT_LIMIT);
     var pageIndex = clampPage(page, pages.length);
     send(makeMessage(CMD_CONTEXT, {
@@ -1476,13 +1725,15 @@ function replyPermission(sessionId, requestId, text, callback) {
     return;
   }
 
-  dispatchCommand({
-    type: "thread.approval.respond",
-    commandId: randomId("pebble:approval:"),
-    threadId: sessionId,
-    requestId: requestId,
-    decision: decision,
-    createdAt: new Date().toISOString()
+  dispatchForThread(sessionId, function(threadId) {
+    return {
+      type: "thread.approval.respond",
+      commandId: randomId("pebble:approval:"),
+      threadId: threadId,
+      requestId: requestId,
+      decision: decision,
+      createdAt: new Date().toISOString()
+    };
   }, function(error) {
     if (error) {
       sendError(error);
@@ -1500,13 +1751,15 @@ function replyQuestion(sessionId, requestId, text, request) {
     return;
   }
 
-  dispatchCommand({
-    type: "thread.user-input.respond",
-    commandId: randomId("pebble:user-input:"),
-    threadId: sessionId,
-    requestId: requestId,
-    answers: questionAnswersObject(request, answers),
-    createdAt: new Date().toISOString()
+  dispatchForThread(sessionId, function(threadId) {
+    return {
+      type: "thread.user-input.respond",
+      commandId: randomId("pebble:user-input:"),
+      threadId: threadId,
+      requestId: requestId,
+      answers: questionAnswersObject(request, answers),
+      createdAt: new Date().toISOString()
+    };
   }, function(error) {
     if (error) {
       sendError(error);
@@ -1604,11 +1857,13 @@ function shouldInterruptTurn(text) {
 }
 
 function interruptSession(sessionId) {
-  dispatchCommand({
-    type: "thread.turn.interrupt",
-    commandId: randomId("pebble:interrupt:"),
-    threadId: sessionId,
-    createdAt: new Date().toISOString()
+  dispatchForThread(sessionId, function(threadId) {
+    return {
+      type: "thread.turn.interrupt",
+      commandId: randomId("pebble:interrupt:"),
+      threadId: threadId,
+      createdAt: new Date().toISOString()
+    };
   }, function(error) {
     if (error) {
       sendError(error);
@@ -1626,27 +1881,31 @@ function promptSession(sessionId, text) {
       sendError(error || "Thread not found");
       return;
     }
-    dispatchCommand({
-      type: "thread.turn.start",
-      commandId: randomId("pebble:turn:"),
-      threadId: sessionId,
-      message: {
-        messageId: randomId("pebble:"),
-        role: "user",
-        text: prompt,
-        attachments: []
-      },
-      modelSelection: modelSelection(thread.modelSelection),
-      runtimeMode: thread.runtimeMode,
-      interactionMode: thread.interactionMode,
-      createdAt: new Date().toISOString()
+    // modelSelection is deliberately omitted: it is optional on a turn start,
+    // and leaving it out keeps whatever model the thread is already set to on
+    // the server rather than having the watch impose one.
+    dispatchForThread(sessionId, function(threadId) {
+      return {
+        type: "thread.turn.start",
+        commandId: randomId("pebble:turn:"),
+        threadId: threadId,
+        message: {
+          messageId: randomId("pebble:"),
+          role: "user",
+          text: prompt,
+          attachments: []
+        },
+        runtimeMode: thread.runtimeMode,
+        interactionMode: thread.interactionMode,
+        createdAt: new Date().toISOString()
+      };
     }, function(dispatchError) {
       if (dispatchError) {
         sendError(dispatchError);
         return;
       }
       send(makeMessage(CMD_PROMPT, {}));
-      getSnapshot(function() {});
+      invalidateHost(sessionId);
     });
   });
 }
@@ -1663,10 +1922,17 @@ function promptNewThread(projectId, text) {
       sendError(error || "Project not found");
       return;
     }
+    var server = serverById(project.serverId);
+    if (!server) {
+      sendError("Unknown T3 server");
+      return;
+    }
     var now = new Date().toISOString();
     var threadId = randomId("pebble-thread-");
-    var selection = modelSelection(project.defaultModelSelection);
-    dispatchCommand({
+    // A bootstrapped thread has to name a model, so use the project's default
+    // from the server and only fall back when it has none.
+    var selection = resolveModelSelection(project.defaultModelSelection);
+    dispatchCommand(server, {
       type: "thread.turn.start",
       commandId: randomId("pebble:turn:"),
       threadId: threadId,
@@ -1682,7 +1948,7 @@ function promptNewThread(projectId, text) {
       interactionMode: "default",
       bootstrap: {
         createThread: {
-          projectId: project.id,
+          projectId: project.nativeId,
           title: "New thread",
           modelSelection: selection,
           runtimeMode: "full-access",
@@ -1699,46 +1965,53 @@ function promptNewThread(projectId, text) {
         return;
       }
       send(makeMessage(CMD_PROMPT, {}));
-      getSnapshot(function() {});
+      invalidateHost(projectId);
     });
   });
 }
 
-function withThread(threadId, callback) {
-  if (lastSnapshot) {
-    var cached = threadById(lastSnapshot, threadId);
-    if (cached) {
-      callback(null, cached);
-      return;
-    }
+// Fetches (or reuses) the shell snapshot for whichever host owns an id.
+function withShellFor(compositeId, callback) {
+  var serverId = splitCompositeId(compositeId).serverId;
+  var server = serverById(serverId);
+  if (!server) {
+    callback(new Error("Unknown T3 server"));
+    return;
   }
-  getSnapshot(function(error, snapshot) {
+  var cached = shellByServer[serverId];
+  if (cached) {
+    callback(null, cached);
+    return;
+  }
+  httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
     if (error) {
       callback(error);
       return;
     }
-    callback(null, threadById(snapshot, threadId));
+    shellByServer[serverId] = tagSnapshot(server, snapshot);
+    callback(null, shellByServer[serverId]);
+  });
+}
+
+function withThread(threadId, callback) {
+  withShellFor(threadId, function(error, shell) {
+    if (error) {
+      callback(error);
+      return;
+    }
+    callback(null, threadById(shell, threadId));
   });
 }
 
 function withProject(projectId, callback) {
-  if (lastSnapshot) {
-    var projects = lastSnapshot.projects || [];
-    for (var i = 0; i < projects.length; i++) {
-      if (projects[i].id === projectId && !projects[i].deletedAt) {
-        callback(null, projects[i]);
-        return;
-      }
-    }
-  }
-  getSnapshot(function(error, snapshot) {
+  withShellFor(projectId, function(error, shell) {
     if (error) {
       callback(error);
       return;
     }
-    var projects = snapshot.projects || [];
+    var projects = (shell && shell.projects) || [];
     for (var i = 0; i < projects.length; i++) {
-      if (projects[i].id === projectId && !projects[i].deletedAt) {
+      if (projects[i].id === projectId) {
         callback(null, projects[i]);
         return;
       }
@@ -1747,40 +2020,117 @@ function withProject(projectId, callback) {
   });
 }
 
+// A dispatch changes the host's state, so drop its cached shell and let the
+// next screen re-read it rather than showing a stale roll-up.
+function invalidateHost(compositeId) {
+  var serverId = splitCompositeId(compositeId).serverId;
+  if (serverId) {
+    delete shellByServer[serverId];
+  }
+}
+
+// One pasteable line per machine, as printed by run-t3code-tailscale.sh:
+//   t3pebble1|<label>|<base URL>|<token>
+// Deliberately free of helper calls: configurationHtml() embeds this function's
+// own source into the settings page, so the page parses by exactly these rules.
+function parseServerBundle(text) {
+  var found = [];
+  var lines = String(text === null || text === undefined ? "" : text).split(/[\r\n]+/);
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].replace(/^\s+|\s+$/g, "");
+    if (line.indexOf("t3pebble1|") !== 0) {
+      continue;
+    }
+    var parts = line.slice(10).split("|");
+    if (parts.length < 3) {
+      continue;
+    }
+    var label = parts[0].replace(/^\s+|\s+$/g, "");
+    var baseUrl = parts[1].replace(/^\s+|\s+$/g, "").replace(/\/+$/, "");
+    var token = parts[2].replace(/^\s+|\s+$/g, "");
+    if (!baseUrl || !token) {
+      continue;
+    }
+    found.push({ id: "", label: label, baseUrl: baseUrl, token: token });
+  }
+  return found;
+}
+
 function configurationHtml() {
   var current = settings();
+  var seed = current.servers.length ? current.servers : [{ id: "", label: "", baseUrl: "", token: "" }];
   return [
     "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>",
     "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:20px;background:#f7f7f2;color:#111}",
-    "label{display:block;margin:16px 0 6px;font-weight:600}input{box-sizing:border-box;width:100%;font-size:16px;padding:10px;border:1px solid #999;border-radius:6px}",
-    "button{margin-top:18px;width:100%;font-size:17px;padding:12px;border:0;border-radius:6px;background:#111;color:white}</style></head><body>",
+    "label{display:block;margin:12px 0 4px;font-weight:600;font-size:14px}",
+    "input,textarea{box-sizing:border-box;width:100%;font-size:16px;padding:10px;border:1px solid #999;border-radius:6px}",
+    "textarea{font-family:ui-monospace,Menlo,monospace;font-size:13px}",
+    "code{font-size:12px;background:#eee;padding:1px 4px;border-radius:3px}",
+    ".card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px;margin-top:14px}",
+    ".card h3{margin:0;font-size:15px}.head{display:flex;justify-content:space-between;align-items:center}",
+    ".rm{width:auto;margin:0;padding:6px 10px;font-size:13px;background:#c0392b}",
+    "button{margin-top:18px;width:100%;font-size:17px;padding:12px;border:0;border-radius:6px;background:#111;color:white}",
+    ".add{background:#2d6cdf}p.hint{margin:6px 0 0;font-size:13px;color:#555}</style></head><body>",
     "<h2>T3 Pebble</h2>",
-    "<label>Base URL</label><input id='baseUrl' placeholder='http://100.x.y.z:3773' value='", htmlEscape(current.baseUrl), "'>",
-    "<label>Auth token</label><input id='password' type='password' value='", htmlEscape(current.password), "'>",
+    "<p class='hint'>Add one entry per machine running T3 Code. The label is what the watch shows.</p>",
+    "<div class='card'><h3>Quick setup</h3>",
+    "<p class='hint'>Run <code>run-t3code-tailscale.sh</code> on each machine and paste the ",
+    "<code>t3pebble1|...</code> lines it prints. One line per machine; pasting a line again ",
+    "refreshes that machine's token instead of adding a duplicate.</p>",
+    "<textarea id='bundle' rows='4' placeholder='t3pebble1|beta1|https://beta1.tailnet.ts.net|token'></textarea>",
+    "<button class='add' onclick='addFromPaste()'>Add from paste</button>",
+    "<p class='hint' id='pasteMsg'></p></div>",
+    "<div id='servers'></div>",
+    "<button class='add' onclick='addServer()'>+ Add server</button>",
     "<button onclick='save()'>Save</button>",
-    "<script>function save(){var data={baseUrl:document.getElementById('baseUrl').value,password:document.getElementById('password').value};",
-    "location.href='pebblejs://close#'+encodeURIComponent(JSON.stringify(data));}</script></body></html>"
+    "<script>",
+    "var MAX=", String(MAX_SERVERS), ";",
+    "var servers=", JSON.stringify(seed), ";",
+    "var parseServerBundle=", String(parseServerBundle), ";",
+    "function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}",
+    "function render(){var h='';for(var i=0;i<servers.length;i++){var s=servers[i];",
+    "h+=\"<div class='card'><div class='head'><h3>Server \"+(i+1)+\"</h3>\";",
+    "if(servers.length>1){h+=\"<button class='rm' onclick='removeServer(\"+i+\")'>Remove</button>\";}",
+    "h+=\"</div><label>Label</label><input data-i='\"+i+\"' data-f='label' placeholder='laptop' value='\"+esc(s.label)+\"'>\";",
+    "h+=\"<label>Base URL</label><input data-i='\"+i+\"' data-f='baseUrl' placeholder='https://host.ts.net or http://100.x.y.z:3773' value='\"+esc(s.baseUrl)+\"'>\";",
+    "h+=\"<label>Access token</label><input data-i='\"+i+\"' data-f='token' type='password' value='\"+esc(s.token)+\"'>\";",
+    "h+=\"<p class='hint'>Issue one with <code>t3 auth session issue --token-only</code>.</p></div>\";}",
+    "document.getElementById('servers').innerHTML=h;",
+    "var inputs=document.querySelectorAll('#servers input');",
+    "for(var j=0;j<inputs.length;j++){inputs[j].addEventListener('input',function(e){",
+    "servers[+e.target.getAttribute('data-i')][e.target.getAttribute('data-f')]=e.target.value;});}}",
+    "function addFromPaste(){var ta=document.getElementById('bundle');var msg=document.getElementById('pasteMsg');",
+    "var found=parseServerBundle(ta.value);",
+    "if(!found.length){msg.textContent='No setup lines found. Paste the t3pebble1|... line.';return;}",
+    "if(servers.length===1&&!servers[0].baseUrl&&!servers[0].token){servers=[];}",
+    "var added=0,updated=0,skipped=0;",
+    "for(var i=0;i<found.length;i++){var f=found[i];var hit=-1;",
+    "for(var j=0;j<servers.length;j++){if(servers[j].baseUrl===f.baseUrl){hit=j;break;}}",
+    "if(hit>=0){if(f.label){servers[hit].label=f.label;}servers[hit].token=f.token;updated++;continue;}",
+    "if(servers.length>=MAX){skipped++;continue;}",
+    "servers.push({id:'',label:f.label,baseUrl:f.baseUrl,token:f.token});added++;}",
+    "ta.value='';",
+    "msg.textContent=added+' added, '+updated+' updated'+(skipped?', '+skipped+' skipped (max '+MAX+')':'');",
+    "render();}",
+    "function addServer(){if(servers.length>=MAX){return;}servers.push({id:'',label:'',baseUrl:'',token:''});render();}",
+    "function removeServer(i){servers.splice(i,1);if(!servers.length){servers.push({id:'',label:'',baseUrl:'',token:''});}render();}",
+    "function save(){location.href='pebblejs://close#'+encodeURIComponent(JSON.stringify({servers:servers}));}",
+    "render();",
+    "</script></body></html>"
   ].join("");
 }
 
-function htmlEscape(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
 Pebble.addEventListener("ready", function() {
-  refreshSessions();
+  refreshHosts();
 });
 
 Pebble.addEventListener("appmessage", function(event) {
   var message = event.payload || {};
   var command = message[KEY_CMD];
   if (command === CMD_REFRESH) {
-    refreshSessions();
+    refreshHosts();
+  } else if (command === CMD_SELECT_HOST) {
+    selectHost(message[KEY_HOST_ID]);
   } else if (command === CMD_DETAIL) {
     detail(message[KEY_SESSION_ID], message[KEY_INDEX] || 0);
   } else if (command === CMD_CONTEXT) {
@@ -1802,8 +2152,17 @@ Pebble.addEventListener("webviewclosed", function(event) {
   }
   try {
     saveSettings(JSON.parse(decodeURIComponent(event.response)));
-    refreshSessions();
+    shellByServer = {};
+    refreshHosts();
   } catch (e) {
     sendError("Settings not saved");
   }
 });
+
+
+
+//////////////////
+// WEBPACK FOOTER
+// ./src/pkjs/index.js
+// module id = 2
+// module chunks = 0

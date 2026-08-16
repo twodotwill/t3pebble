@@ -1,74 +1,68 @@
 # T3 Code Compatibility
 
-This document records the T3 Code API assumptions used by T3 Pebble.
+This document records the T3 Code API surface T3 Pebble depends on.
 
-## Current T3 Pebble Target
+## Target
 
-T3 Pebble currently targets T3 Code commit:
+Stock, unmodified T3 Code. The published `t3` CLI, installed with `npm install -g t3` or run through `npx t3@latest`.
 
-```text
-226ed997e1a6493e6b29d5264e0b0f8173e7c630
+Verified against `t3@0.0.33` and upstream `main` at `277322933` (`v0.0.34-nightly.20260816`).
+
+There is no compatibility branch and no server patch. The earlier fork — which re-added `--auth-token`, legacy `?token=` WebSocket auth, and an `orchestration.getSnapshot` RPC — is no longer used.
+
+## Required API Surface
+
+### Auth
+
+A bearer access token issued by the CLI:
+
+```sh
+t3 auth session issue --ttl 365d --label "T3 Pebble watch" --token-only
 ```
 
-The T3 Code fork publishes this commit as:
+That grants `AuthAdministrativeScopes`, which includes the two scopes the app needs: `orchestration:read` and `orchestration:operate`. The token must be issued against the same data directory the server runs with (`--base-dir`, or the default).
 
-```text
-t3pebble-auth-token-compatible
-```
+Every request carries it as `Authorization: Bearer <token>`. There is no pairing exchange, no WebSocket ticket, and no session cookie involved.
 
-That commit is upstream T3 Code before the newer pairing/session remote-access rewrite. It is not a custom T3 Code runtime patch.
+### Reads
 
-## Required Old API Surface
+| Route | Used for |
+| --- | --- |
+| `GET /api/orchestration/snapshot` | Projects and thread metadata |
+| `GET /api/orchestration/threads/:threadId?turnLimit=N` | Thread bodies: messages, activities, session |
 
-The Pebble phone bridge currently requires:
+The snapshot route serves the *command read model*: every thread arrives with `messages`, `activities`, and `checkpoints` empty, but with `session` and `latestTurn` populated. That is enough for a first paint of the list, and the app then hydrates each thread over the thread detail route.
 
-- Server startup with `--auth-token`.
-- WebSocket RPC auth via `/ws?token=<token>`.
-- `orchestration.getSnapshot` to fetch projects and threads.
-- `orchestration.dispatchCommand` to start turns, create threads, respond to approvals, answer user-input prompts, and interrupt turns.
+Turn windows requested by the app:
 
-## Current Upstream T3 Code Differences
+- `turnLimit=6` for list rows and the detail card
+- `turnLimit=40` for the transcript view
 
-Current upstream T3 Code `0.0.27` has these important differences:
+The thread detail response is `{ snapshotSequence, thread, page }`.
 
-- `--auth-token` is gone.
-- Headless `t3 serve` prints a one-time pairing token and `/pair#token=...` URL.
-- HTTP auth uses browser sessions, bearer access tokens, DPoP tokens, and WebSocket tickets.
-- WebSocket auth uses `wsTicket`, not the old `token` query parameter.
-- `orchestration.getSnapshot` is gone.
-- The read side moved to:
-  - `orchestration.subscribeShell`
-  - `orchestration.subscribeThread`
-  - `orchestration.getArchivedShellSnapshot`
+### Writes
 
-The write command names used by T3 Pebble are still broadly recognizable:
+`POST /api/orchestration/dispatch`, carrying a `ClientOrchestrationCommand`:
 
-- `orchestration.dispatchCommand`
-- `thread.turn.start`
+- `thread.turn.start` (including the `bootstrap.createThread` form used to start a thread in a project)
 - `thread.turn.interrupt`
 - `thread.approval.respond`
 - `thread.user-input.respond`
 
-## Why T3 Code Was Not Patched
+A malformed command is rejected with `400 invalid_request`.
 
-The goal is to keep T3 Code vanilla and put Pebble-specific behavior in the Pebble app. That avoids maintaining a server fork for watch support.
+### Error shapes
 
-The only reason the fork exists is to:
+Errors are tagged JSON, for example:
 
-- pin the last known T3 Code commit that supports the current Pebble app;
-- publish a compatibility branch for repeatable setup;
-- document the Pebble integration and migration requirements.
+```json
+{"_tag":"EnvironmentAuthInvalidError","code":"auth_invalid","reason":"missing_credential","traceId":"..."}
+```
 
-## Migration Needed For Current Upstream
+The bridge reads `reason` / `requiredScope` for its status line. Relevant statuses: `401` (bad or missing token), `403` (missing scope), `404` with `reason: "thread_not_found"`.
 
-To run against current upstream T3 Code, T3 Pebble needs these app-side changes:
+## Notes
 
-1. Accept a T3 pairing URL or pairing token in settings.
-2. Exchange the one-time pairing credential for an access token.
-3. Request a WebSocket ticket before opening each WebSocket RPC session.
-4. Connect to `/ws?wsTicket=<ticket>`.
-5. Replace `orchestration.getSnapshot` with `orchestration.subscribeShell`.
-6. Use `orchestration.subscribeThread` for richer per-thread detail updates.
-7. Keep `orchestration.dispatchCommand` for write operations where the current command schemas still match.
-
-The optional legacy `?token=` mode can remain as a transition path while old compatible T3 Code servers are still running.
+- `access-control-allow-origin` is `*`, so the PebbleKit JS sandbox can call the API directly.
+- The WebSocket RPC endpoint still exists on mainline, but the app no longer uses it. Its read side is subscription-based (`orchestration.subscribeShell`, `orchestration.subscribeThread`), which is a poor fit for a watch that polls; the REST routes carry the same data in one request each.
+- `t3 serve` supports `--host`, `--port`, `--base-dir`, and `--no-browser`, which is all the launch script needs. Mainline also ships `--tailscale-serve` if you would rather it manage Tailscale itself.

@@ -17,6 +17,16 @@ Copy the installable bundle from the repo root:
 cp pebblecode/build/pebblecode.pbw dist/t3pebble.pbw
 ```
 
+## T3 Code
+
+The app runs against stock T3 Code (the published `t3` CLI). Do not patch T3 Code, and do not reintroduce `--auth-token` or `orchestration.getSnapshot`; both were fork-only. The bridge authenticates with a bearer token from `t3 auth session issue` and uses the REST routes documented in `docs/t3code-compatibility.md`.
+
+`./verify-t3pebble.sh` runs the bridge tests, builds the PBW, and smoke-tests against a real `t3 serve` on a throwaway data directory.
+
+Multi-host setup goes through one pasteable line per machine, `t3pebble1|<label>|<base URL>|<token>`, printed by the launch script and parsed by `parseServerBundle()` in the bridge. The settings page embeds that function's own source via `String(parseServerBundle)` rather than reimplementing it, so the two cannot drift — keep it free of helper calls. Pasting a line for an already-configured base URL updates that entry's token instead of appending.
+
+`run-t3code-tailscale.sh` defaults to binding the Tailscale IP over plain HTTP. `T3PEBBLE_TAILSCALE_SERVE=1` opts into publishing loopback over tailnet HTTPS via `tailscale serve --bg` instead, which is what reaches a T3 Code desktop app that only listens on `127.0.0.1`. Keep the default path unchanged; the flag is additive. Auth is the same bearer token in both modes — do not add a pairing exchange to the bridge.
+
 ## Watch Install
 
 The local `pebble` command is a Docker wrapper. Use repo-relative PBW paths, not host absolute paths, when calling Pebble SDK commands.

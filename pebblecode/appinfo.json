@@ -31,7 +31,15 @@
     "request_id": 12,
     "request_kind": 13,
     "project_id": 14,
-    "context_page": 15
+    "context_page": 15,
+    "server": 16,
+    "state": 17,
+    "host_id": 18,
+    "detail": 19,
+    "c_needs": 20,
+    "c_run": 21,
+    "c_idle": 22,
+    "c_settled": 23
   },
   "resources": {
     "media": []
