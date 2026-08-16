@@ -22,6 +22,15 @@ var KEY_C_NEEDS = "c_needs";
 var KEY_C_RUN = "c_run";
 var KEY_C_IDLE = "c_idle";
 var KEY_C_SETTLED = "c_settled";
+// Which slice of a host's threads the watch is looking at, and where in it.
+var KEY_SCOPE = "scope";
+var KEY_OFFSET = "offset";
+var KEY_MATCHED = "matched";
+var KEY_OTHER = "other";
+var KEY_SETTLED = "settled";
+var KEY_ACTION = "action";
+var KEY_PATH = "path";
+var KEY_NAME = "name";
 
 var CMD_REFRESH = 1;
 var CMD_SESSION_ITEM = 2;
@@ -37,6 +46,16 @@ var CMD_NEW_THREAD = 11;
 var CMD_HOST_ITEM = 12;
 var CMD_HOST_END = 13;
 var CMD_SELECT_HOST = 14;
+var CMD_THREAD_ACTION = 15;
+var CMD_PROJECT_NAME = 16;
+var CMD_PROJECT_PREVIEW = 17;
+var CMD_PROJECT_CREATE = 18;
+var CMD_CONCIERGE = 19;
+
+// Which slice of a host's threads a request wants. Settled covers the snoozed
+// ones too: both mean "not asking for anything right now".
+var SCOPE_ACTIVE = 0;
+var SCOPE_SETTLED = 1;
 
 var MAX_SESSIONS = 20;
 var SUMMARY_LIMIT = 150;
@@ -152,7 +171,13 @@ function normalizeServer(server) {
     id: trim(server.id),
     label: compact(trim(server.label) || hostShortName(baseUrl), 18),
     baseUrl: baseUrl,
-    token: trim(server.token || DEFAULT_TOKEN)
+    token: trim(server.token || DEFAULT_TOKEN),
+    // Where a project dictated from the watch gets created. Per host, because
+    // six machines rarely agree on where work lives. Empty disables the flow.
+    projectRoot: trim(server.projectRoot || "").replace(/\/+$/, ""),
+    // Optional project whose agent proposes a path when the location is easier
+    // described than dictated. Empty disables the concierge route.
+    concierge: trim(server.concierge || "")
   };
 }
 
@@ -650,6 +675,13 @@ function makeMessage(command, fields) {
   if (fields.state !== undefined) message[KEY_STATE] = fields.state;
   if (fields.hostId !== undefined) message[KEY_HOST_ID] = fields.hostId;
   if (fields.detail !== undefined) message[KEY_DETAIL] = fields.detail;
+  if (fields.scope !== undefined) message[KEY_SCOPE] = fields.scope;
+  if (fields.offset !== undefined) message[KEY_OFFSET] = fields.offset;
+  if (fields.matched !== undefined) message[KEY_MATCHED] = fields.matched;
+  if (fields.other !== undefined) message[KEY_OTHER] = fields.other;
+  if (fields.settled !== undefined) message[KEY_SETTLED] = fields.settled;
+  if (fields.path !== undefined) message[KEY_PATH] = fields.path;
+  if (fields.name !== undefined) message[KEY_NAME] = fields.name;
   if (fields.counts !== undefined) {
     message[KEY_C_NEEDS] = fields.counts.needs;
     message[KEY_C_RUN] = fields.counts.run;
@@ -813,6 +845,17 @@ function threadState(thread, nowMs) {
   return "idle";
 }
 
+function agentLabel(thread) {
+  var session = thread.session || {};
+  var selection = thread.modelSelection || {};
+  var provider = session.providerName || selection.instanceId || selection.provider || "";
+  var model = selection.model || "";
+  if (provider && model) {
+    return compact(provider + " " + model, 30);
+  }
+  return compact(provider || model || "agent", 30);
+}
+
 function relativeAge(iso, nowMs) {
   var ms = parseTime(iso);
   if (isNaN(ms)) {
@@ -831,9 +874,11 @@ function relativeAge(iso, nowMs) {
   return Math.round(delta / DAY_MS) + "d";
 }
 
-function threadDetailLine(thread, state, nowMs) {
+function threadDetailLine(thread, state, nowMs, waitingSince) {
   if (state === "needs") {
-    return thread.hasPendingApprovals ? "needs approval" : "needs an answer";
+    var kind = thread.hasPendingApprovals ? "approval" : "answer";
+    var waited = waitingSince ? relativeAge(waitingSince, nowMs) : "";
+    return waited ? "waiting " + waited + " for " + kind : "needs " + kind;
   }
   if (state === "run") {
     var progress = thread.planProgress;
@@ -860,6 +905,26 @@ function activeThreads(snapshot) {
   return newestFirst(threads.filter(function(thread) {
     return !thread.deletedAt && !thread.archivedAt;
   })).slice(0, MAX_SESSIONS);
+}
+
+// True when a thread is not asking for anything: explicitly settled, aged out
+// past the auto-settle window, or snoozed until later.
+function isRestingState(state) {
+  return state === "settled" || state === "snooze";
+}
+
+// One scope's worth of threads, newest first and unpaged. Ordering stays by
+// activity rather than by settledAt, so a thread that aged out sits where its
+// work left it rather than jumping to the moment the server noticed.
+function threadsForScope(snapshot, scope, nowMs) {
+  var threads = snapshot && snapshot.threads ? snapshot.threads : [];
+  var wantResting = scope === SCOPE_SETTLED;
+  return newestFirst(threads.filter(function(thread) {
+    if (thread.deletedAt || thread.archivedAt) {
+      return false;
+    }
+    return isRestingState(threadState(thread, nowMs)) === wantResting;
+  }));
 }
 
 function activeProjects(snapshot) {
@@ -1210,19 +1275,27 @@ function refreshHosts() {
 
 // --- one host's threads -----------------------------------------------
 
-function selectHost(hostId) {
+function selectHost(hostId, scope, offset) {
   var server = serverById(hostId);
+  scope = scope === SCOPE_SETTLED ? SCOPE_SETTLED : SCOPE_ACTIVE;
+  offset = offset > 0 ? offset : 0;
   if (!server) {
     sendError("Unknown host");
-    send(makeMessage(CMD_SESSION_END, { total: 0 }));
+    send(makeMessage(CMD_SESSION_END, { total: 0, scope: scope, offset: 0, matched: 0 }));
     return;
   }
 
   function emit(tagged) {
     lastSnapshot = tagged;
     var nowMs = Date.now();
-    var threads = activeThreads(tagged);
-    sendSessionItems(threads.map(function(thread) {
+    var matched = threadsForScope(tagged, scope, nowMs);
+    // Settled history outgrows the watch's fixed list, so it arrives a page at
+    // a time rather than by raising the cap for a list that is rarely opened.
+    if (offset >= matched.length) {
+      offset = 0;
+    }
+    var page = matched.slice(offset, offset + MAX_SESSIONS);
+    sendSessionItems(page.map(function(thread) {
       var state = threadState(thread, nowMs);
       return {
         id: thread.id,
@@ -1231,9 +1304,17 @@ function selectHost(hostId) {
         state: state,
         summary: "",
         requestId: "",
-        requestKind: state === "needs" ? (thread.hasPendingApprovals ? "permission" : "question") : ""
+        requestKind: state === "needs" ? (thread.hasPendingApprovals ? "permission" : "question") : "",
+        settled: isRestingState(state)
       };
-    }));
+    }), {
+      scope: scope,
+      offset: offset,
+      matched: matched.length,
+      // The count for the other scope's footer row, so the watch can label the
+      // way out without asking for a list it is not showing.
+      other: threadsForScope(tagged, scope === SCOPE_ACTIVE ? SCOPE_SETTLED : SCOPE_ACTIVE, nowMs).length
+    });
     sendProjectItems(activeProjects(tagged).map(toPebbleProject));
   }
 
@@ -1308,13 +1389,22 @@ function eachLimit(items, limit, worker, done) {
   pump();
 }
 
-function sendSessionItems(items) {
+function sendSessionItems(items, page) {
+  page = page || {};
   cachedSessions = {};
   for (var i = 0; i < items.length; i++) {
     cachedSessions[items[i].id] = items[i];
     send(makeMessage(CMD_SESSION_ITEM, itemFields(items[i], i, items.length)));
   }
-  send(makeMessage(CMD_SESSION_END, { total: items.length }));
+  send(makeMessage(CMD_SESSION_END, {
+    total: items.length,
+    scope: page.scope || SCOPE_ACTIVE,
+    offset: page.offset || 0,
+    // How many threads the scope holds in all, so the watch knows whether a
+    // further page exists without a second round trip.
+    matched: page.matched === undefined ? items.length : page.matched,
+    other: page.other || 0
+  }));
 }
 
 
@@ -1506,9 +1596,12 @@ function itemFields(item, index, total) {
     title: item.title,
     detail: item.detail,
     state: item.state,
+    agent: item.agent || "",
     summary: item.summary || "",
     requestId: item.requestId || "",
-    requestKind: item.requestKind || ""
+    requestKind: item.requestKind || "",
+    // Lets the watch build the right action menu without a second lookup.
+    settled: item.settled ? 1 : 0
   };
 }
 
@@ -1562,10 +1655,12 @@ function sendThreadDetail(sessionId, index, lifecycle, thread) {
       delete pendingBySession[sessionId];
     }
 
+    var waitingSince = approval ? approval.createdAt : (input ? input.createdAt : null);
     var item = {
       id: sessionId,
       title: compact(thread.title || "Untitled", 54),
-      detail: threadDetailLine(lifecycle, state, nowMs),
+      agent: agentLabel(lifecycle && lifecycle.session ? lifecycle : thread),
+      detail: threadDetailLine(lifecycle, state, nowMs, waitingSince),
       state: state,
       summary: summary,
       requestId: approval ? approval.requestId : (input ? input.requestId : ""),
@@ -1884,6 +1979,135 @@ function interruptSession(sessionId) {
   });
 }
 
+// --- creating a project from the watch --------------------------------
+
+// Dictation gives back a phrase, not a directory name. Fold it to something a
+// filesystem is happy with, without inventing characters the user did not say.
+function projectSlug(text) {
+  var slug = String(text || "")
+    .toLowerCase()
+    .replace(/['`’]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.slice(0, 48);
+}
+
+function projectPathFor(server, name) {
+  var slug = projectSlug(name);
+  if (!server.projectRoot || !slug) {
+    return "";
+  }
+  return server.projectRoot + "/" + slug;
+}
+
+// Step one: resolve the dictated name to an absolute path and hand it back for
+// confirmation. Nothing is created until the watch sends it to CMD_PROJECT_CREATE.
+function previewProject(hostId, name) {
+  var server = serverById(hostId);
+  if (!server) {
+    sendError("Unknown host");
+    return;
+  }
+  if (!server.projectRoot) {
+    sendError("Set a project root in settings");
+    return;
+  }
+  var path = projectPathFor(server, name);
+  if (!path) {
+    sendError("Could not read a project name");
+    return;
+  }
+  send(makeMessage(CMD_PROJECT_PREVIEW, {
+    hostId: hostId,
+    name: compact(trim(name), 40),
+    path: path
+  }));
+}
+
+// Step two: the user approved the path shown on the glass, so create it. The
+// watch dispatches this itself rather than delegating to an agent, so the
+// confirmation is a real gate rather than a notification after the fact.
+function createProject(hostId, name, path) {
+  var server = serverById(hostId);
+  if (!server) {
+    sendError("Unknown host");
+    return;
+  }
+  var workspaceRoot = trim(path) || projectPathFor(server, name);
+  if (!workspaceRoot) {
+    sendError("No project path");
+    return;
+  }
+  var title = compact(trim(name) || projectSlug(name), 40);
+  dispatchCommand(server, {
+    type: "project.create",
+    commandId: randomId("pebble:proj:"),
+    projectId: randomId("pebble-project-"),
+    title: title || "New project",
+    workspaceRoot: workspaceRoot,
+    createWorkspaceRootIfMissing: true,
+    createdAt: new Date().toISOString()
+  }, function(error) {
+    if (error) {
+      sendError(error);
+      return;
+    }
+    shellByServer[hostId] = null;
+    send(makeMessage(CMD_PROMPT, {}));
+  });
+}
+
+// The concierge route: when the location is easier described than dictated,
+// ask the designated project's agent to propose an absolute path. It only
+// proposes -- createProject above still does the creating, after you approve.
+function conciergeProject(hostId, text) {
+  var server = serverById(hostId);
+  if (!server) {
+    sendError("Unknown host");
+    return;
+  }
+  if (!server.concierge) {
+    sendError("Set a concierge project in settings");
+    return;
+  }
+  var ask = "The user asked, from their Pebble watch: \"" + trim(text) + "\"\n\n" +
+    "They want a new T3 Code project created on this machine. Work out the " +
+    "absolute path it should live at, using nearby checkouts for context. Do " +
+    "not create anything. Reply with the last line of your response being " +
+    "exactly:\n\nPROJECT_PATH: /absolute/path/here";
+  promptNewThread(hostId + ID_SEPARATOR + server.concierge, ask);
+}
+
+// Settle marks a thread as no longer wanting the user; unsettle reopens it.
+// `reason: "user"` is required by the server and is what makes the reopen
+// stick as an explicit override rather than an auto-settle candidate.
+function settleSession(sessionId, settled) {
+  dispatchForThread(sessionId, function(threadId) {
+    if (settled) {
+      return {
+        type: "thread.settle",
+        commandId: randomId("pebble:settle:"),
+        threadId: threadId
+      };
+    }
+    return {
+      type: "thread.unsettle",
+      commandId: randomId("pebble:unsettle:"),
+      threadId: threadId,
+      reason: "user"
+    };
+  }, function(error) {
+    if (error) {
+      sendError(error);
+      return;
+    }
+    // The list the watch is holding is now wrong in a way a redraw cannot fix,
+    // so drop the cached snapshot and let the next poll refill it.
+    invalidateHost(sessionId);
+    send(makeMessage(CMD_PROMPT, {}));
+  });
+}
+
 function promptSession(sessionId, text) {
   var instruction = "This message was sent from the user's Pebble watch through t3pebble. The user can open the full response, but they will mostly read the ending on the watch. End your reply with the last five sentences as a useful Pebble summary of what you did and what, if anything, you need from the user.";
   var prompt = text + "\n\n" + instruction;
@@ -2071,17 +2295,19 @@ function parseServerBundle(text) {
     var label = parts[0].replace(/^\s+|\s+$/g, "");
     var baseUrl = parts[1].replace(/^\s+|\s+$/g, "").replace(/\/+$/, "");
     var token = parts[2].replace(/^\s+|\s+$/g, "");
+    // Field four is optional, so lines written before it existed still parse.
+    var projectRoot = (parts[3] || "").replace(/^\s+|\s+$/g, "").replace(/\/+$/, "");
     if (!baseUrl || !token) {
       continue;
     }
-    found.push({ id: "", label: label, baseUrl: baseUrl, token: token });
+    found.push({ id: "", label: label, baseUrl: baseUrl, token: token, projectRoot: projectRoot });
   }
   return found;
 }
 
 function configurationHtml() {
   var current = settings();
-  var seed = current.servers.length ? current.servers : [{ id: "", label: "", baseUrl: "", token: "" }];
+  var seed = current.servers.length ? current.servers : [{ id: "", label: "", baseUrl: "", token: "", projectRoot: "", concierge: "" }];
   return [
     "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>",
     "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:20px;background:#f7f7f2;color:#111}",
@@ -2117,6 +2343,10 @@ function configurationHtml() {
     "h+=\"</div><label>Label</label><input data-i='\"+i+\"' data-f='label' placeholder='laptop' value='\"+esc(s.label)+\"'>\";",
     "h+=\"<label>Base URL</label><input data-i='\"+i+\"' data-f='baseUrl' placeholder='https://host.ts.net or http://100.x.y.z:3773' value='\"+esc(s.baseUrl)+\"'>\";",
     "h+=\"<label>Access token</label><input data-i='\"+i+\"' data-f='token' type='password' value='\"+esc(s.token)+\"'>\";",
+    "h+=\"<label>Project root</label><input data-i='\"+i+\"' data-f='projectRoot' placeholder='/home/you/Projects' value='\"+esc(s.projectRoot||'')+\"'>\";",
+    "h+=\"<p class='hint'>Where a project dictated from the watch is created. Leave blank to turn that off.</p>\";",
+    "h+=\"<label>Concierge project id</label><input data-i='\"+i+\"' data-f='concierge' placeholder='optional' value='\"+esc(s.concierge||'')+\"'>\";",
+    "h+=\"<p class='hint'>Optional. An agent in this project proposes a path when you would rather describe the location than dictate it.</p>\";",
     "h+=\"<p class='hint'>Issue one with <code>t3 auth session issue --token-only</code>.</p></div>\";}",
     "document.getElementById('servers').innerHTML=h;",
     "var inputs=document.querySelectorAll('#servers input');",
@@ -2129,14 +2359,15 @@ function configurationHtml() {
     "var added=0,updated=0,skipped=0;",
     "for(var i=0;i<found.length;i++){var f=found[i];var hit=-1;",
     "for(var j=0;j<servers.length;j++){if(servers[j].baseUrl===f.baseUrl){hit=j;break;}}",
-    "if(hit>=0){if(f.label){servers[hit].label=f.label;}servers[hit].token=f.token;updated++;continue;}",
+    "if(hit>=0){if(f.label){servers[hit].label=f.label;}servers[hit].token=f.token;",
+    "if(f.projectRoot){servers[hit].projectRoot=f.projectRoot;}updated++;continue;}",
     "if(servers.length>=MAX){skipped++;continue;}",
-    "servers.push({id:'',label:f.label,baseUrl:f.baseUrl,token:f.token});added++;}",
+    "servers.push({id:'',label:f.label,baseUrl:f.baseUrl,token:f.token,projectRoot:f.projectRoot||'',concierge:''});added++;}",
     "ta.value='';",
     "msg.textContent=added+' added, '+updated+' updated'+(skipped?', '+skipped+' skipped (max '+MAX+')':'');",
     "render();}",
-    "function addServer(){if(servers.length>=MAX){return;}servers.push({id:'',label:'',baseUrl:'',token:''});render();}",
-    "function removeServer(i){servers.splice(i,1);if(!servers.length){servers.push({id:'',label:'',baseUrl:'',token:''});}render();}",
+    "function addServer(){if(servers.length>=MAX){return;}servers.push({id:'',label:'',baseUrl:'',token:'',projectRoot:'',concierge:''});render();}",
+    "function removeServer(i){servers.splice(i,1);if(!servers.length){servers.push({id:'',label:'',baseUrl:'',token:'',projectRoot:'',concierge:''});}render();}",
     "function save(){location.href='pebblejs://close#'+encodeURIComponent(JSON.stringify({servers:servers}));}",
     "render();",
     "</script></body></html>"
@@ -2153,7 +2384,22 @@ Pebble.addEventListener("appmessage", function(event) {
   if (command === CMD_REFRESH) {
     refreshHosts();
   } else if (command === CMD_SELECT_HOST) {
-    selectHost(message[KEY_HOST_ID]);
+    selectHost(message[KEY_HOST_ID], message[KEY_SCOPE] || 0, message[KEY_OFFSET] || 0);
+  } else if (command === CMD_THREAD_ACTION) {
+    var action = message[KEY_ACTION];
+    if (action === "settle" || action === "unsettle") {
+      settleSession(message[KEY_SESSION_ID], action === "settle");
+    } else if (action === "interrupt") {
+      interruptSession(message[KEY_SESSION_ID]);
+    } else {
+      sendError("Unknown action");
+    }
+  } else if (command === CMD_PROJECT_NAME) {
+    previewProject(message[KEY_HOST_ID], trim(message[KEY_NAME]));
+  } else if (command === CMD_PROJECT_CREATE) {
+    createProject(message[KEY_HOST_ID], trim(message[KEY_NAME]), trim(message[KEY_PATH]));
+  } else if (command === CMD_CONCIERGE) {
+    conciergeProject(message[KEY_HOST_ID], trim(message[KEY_PROMPT]));
   } else if (command === CMD_DETAIL) {
     detail(message[KEY_SESSION_ID], message[KEY_INDEX] || 0);
   } else if (command === CMD_CONTEXT) {

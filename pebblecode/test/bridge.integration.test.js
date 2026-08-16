@@ -13,13 +13,15 @@ const iso = (msAgo) => new Date(NOW - msAgo).toISOString()
 const CMD = {
   refresh: 1, sessionItem: 2, sessionEnd: 3, detail: 4, prompt: 5, error: 6,
   context: 7, status: 8, projectItem: 9, projectEnd: 10, newThread: 11,
-  hostItem: 12, hostEnd: 13, selectHost: 14,
+  hostItem: 12, hostEnd: 13, selectHost: 14, threadAction: 15,
+  projectName: 16, projectPreview: 17, projectCreate: 18, concierge: 19,
 }
 
 const KEY = {
   cmd: "cmd", index: "index", sessionId: "session_id", projectId: "project_id",
   prompt: "prompt", requestId: "request_id", requestKind: "request_kind",
-  contextPage: "context_page", hostId: "host_id",
+  contextPage: "context_page", hostId: "host_id", scope: "scope",
+  offset: "offset", action: "action", name: "name", path: "path",
 }
 
 function baseThread(overrides = {}) {
@@ -269,13 +271,52 @@ async function main() {
   for (const message of bridge.sentMessages.filter((m) => m.cmd === CMD.sessionItem)) {
     rows[message.session_id] = message
   }
-  assert.strictEqual(Object.keys(rows).length, 3)
+  // Active scope is the default and leaves settled work out of the way.
+  assert.strictEqual(Object.keys(rows).length, 2)
   assert.strictEqual(rows["s1::ses_running"].state, "run")
   assert.strictEqual(rows["s1::ses_running"].detail, "running")
   assert.strictEqual(rows["s1::ses_blocked"].state, "needs")
   assert.strictEqual(rows["s1::ses_blocked"].detail, "needs approval")
-  assert.strictEqual(rows["s1::ses_settled"].state, "settled")
-  assert.match(rows["s1::ses_settled"].detail, /^settled /)
+  assert.strictEqual(rows["s1::ses_settled"], undefined)
+  // The end message carries the other scope's count for the footer row.
+  const activeEnd = bridge.sentMessages.filter((m) => m.cmd === CMD.sessionEnd).pop()
+  assert.strictEqual(activeEnd.scope, 0)
+  assert.strictEqual(activeEnd.matched, 2)
+  assert.strictEqual(activeEnd.other, 1)
+
+  // --- settled scope holds the finished work ----------------------------
+  bridge.sentMessages.length = 0
+  bridge.listeners.appmessage({ payload: { [KEY.cmd]: CMD.selectHost, [KEY.hostId]: "s1", [KEY.scope]: 1 } })
+  await waitFor(() => bridge.sentMessages.find((m) => m.cmd === CMD.projectEnd), "settled scope end")
+  const settledRows = bridge.sentMessages.filter((m) => m.cmd === CMD.sessionItem)
+  assert.strictEqual(settledRows.length, 1)
+  assert.strictEqual(settledRows[0].session_id, "s1::ses_settled")
+  assert.strictEqual(settledRows[0].state, "settled")
+  // The watch builds its action menu from this flag.
+  assert.strictEqual(settledRows[0].settled, 1)
+  const settledEnd = bridge.sentMessages.filter((m) => m.cmd === CMD.sessionEnd).pop()
+  assert.strictEqual(settledEnd.scope, 1)
+  assert.strictEqual(settledEnd.other, 2)
+
+  // --- settling and unsettling ------------------------------------------
+  bridge.listeners.appmessage({
+    payload: { [KEY.cmd]: CMD.threadAction, [KEY.sessionId]: "s1::ses_blocked", [KEY.action]: "settle" },
+  })
+  await waitFor(() => state.dispatches.some((d) => d.type === "thread.settle"), "settle dispatch")
+  assert.strictEqual(state.dispatches.find((d) => d.type === "thread.settle").threadId, "ses_blocked")
+
+  bridge.listeners.appmessage({
+    payload: { [KEY.cmd]: CMD.threadAction, [KEY.sessionId]: "s1::ses_settled", [KEY.action]: "unsettle" },
+  })
+  await waitFor(() => state.dispatches.some((d) => d.type === "thread.unsettle"), "unsettle dispatch")
+  // The server requires this reason, and it is what makes the reopen explicit.
+  assert.strictEqual(state.dispatches.find((d) => d.type === "thread.unsettle").reason, "user")
+
+  // restore the active-scope listing and the dispatch counter the later
+  // assertions build on
+  state.dispatches.length = 0
+  bridge.listeners.appmessage({ payload: { [KEY.cmd]: CMD.selectHost, [KEY.hostId]: "s1" } })
+  await waitFor(() => bridge.sentMessages.find((m) => m.cmd === CMD.projectEnd), "restore listing")
 
   const projectRow = bridge.sentMessages.find((m) => m.cmd === CMD.projectItem)
   assert.strictEqual(projectRow.project_id, "s1::proj_pebble")
@@ -385,6 +426,43 @@ async function main() {
   assert.strictEqual(state.dispatches[3].type, "thread.turn.start")
   assert.strictEqual(state.dispatches[3].threadId, state.dispatches[2].threadId)
   assert.strictEqual(state.dispatches[3].modelSelection.model, "gpt-5-codex")
+
+  // --- creating a project from the watch --------------------------------
+
+  // With no project root configured the flow refuses rather than guessing.
+  bridge.sentMessages.length = 0
+  bridge.listeners.appmessage({
+    payload: { [KEY.cmd]: CMD.projectName, [KEY.hostId]: "s1", [KEY.name]: "sparkle renderer" },
+  })
+  await waitFor(() => bridge.sentMessages.find((m) => m.cmd === CMD.error), "no-root error")
+  assert.match(bridge.sentMessages.find((m) => m.cmd === CMD.error).error, /project root/i)
+
+  // Give the host a project root, leaving the rest of its settings alone.
+  const stored = JSON.parse(bridge.context.localStorage.getItem("t3pebble_settings"))
+  stored.servers[0].projectRoot = "/home/will/Projects"
+  bridge.context.localStorage.setItem("t3pebble_settings", JSON.stringify(stored))
+
+  bridge.sentMessages.length = 0
+  bridge.listeners.appmessage({
+    payload: { [KEY.cmd]: CMD.projectName, [KEY.hostId]: "s1", [KEY.name]: "Sparkle Renderer" },
+  })
+  const preview = await waitFor(
+    () => bridge.sentMessages.find((m) => m.cmd === CMD.projectPreview), "project preview")
+  assert.strictEqual(preview.path, "/home/will/Projects/sparkle-renderer")
+  // Previewing must not create anything; the confirm step is the gate.
+  assert.strictEqual(state.dispatches.filter((d) => d.type === "project.create").length, 0)
+
+  bridge.listeners.appmessage({
+    payload: {
+      [KEY.cmd]: CMD.projectCreate, [KEY.hostId]: "s1",
+      [KEY.name]: "Sparkle Renderer", [KEY.path]: preview.path,
+    },
+  })
+  await waitFor(() => state.dispatches.some((d) => d.type === "project.create"), "project create")
+  const created = state.dispatches.find((d) => d.type === "project.create")
+  assert.strictEqual(created.workspaceRoot, "/home/will/Projects/sparkle-renderer")
+  assert.strictEqual(created.title, "Sparkle Renderer")
+  assert.strictEqual(created.createWorkspaceRootIfMissing, true)
 
   assert.deepStrictEqual(
     bridge.sentMessages.filter((m) => m.cmd === CMD.error).map((m) => m.error),

@@ -125,8 +125,13 @@ t3_default_label() {
 # One pasteable line for the Pebble settings page. Parsed by parseServerBundle()
 # in pebblecode/src/pkjs/index.js; keep the two in step.
 t3_bundle_line() {
-  local label="$1" base_url="$2" token="$3"
+  local label="$1" base_url="$2" token="$3" project_root="${4:-}"
   printf 't3pebble1|%s|%s|%s' "${label//|/-}" "$base_url" "$token"
+  # Field four is optional: where a project dictated from the watch is created.
+  if [[ -n "$project_root" ]]; then
+    printf '|%s' "${project_root%/}"
+  fi
+  printf ''
 }
 
 # Points https://<magic-dns>:<serve-port> at the loopback server. `--bg` makes

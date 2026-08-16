@@ -39,6 +39,25 @@
 #define CMD_HOST_ITEM 12
 #define CMD_HOST_END 13
 #define CMD_SELECT_HOST 14
+#define CMD_THREAD_ACTION 15
+#define CMD_PROJECT_NAME 16
+#define CMD_PROJECT_PREVIEW 17
+#define CMD_PROJECT_CREATE 18
+#define CMD_CONCIERGE 19
+
+#define KEY_SCOPE 24
+#define KEY_OFFSET 25
+#define KEY_MATCHED 26
+#define KEY_OTHER 27
+#define KEY_SETTLED 28
+#define KEY_ACTION 29
+#define KEY_PATH 30
+#define KEY_NAME 31
+
+/* Which slice of a host's threads the list is showing. Settled covers snoozed
+   too: both mean the thread is not asking for anything right now. */
+#define SCOPE_ACTIVE 0
+#define SCOPE_SETTLED 1
 
 #define MAX_HOSTS 6
 #define MAX_SESSIONS 20
@@ -53,17 +72,24 @@
    crimson rail pointing at the buttons, the glass, then the same in reverse.
    Both bands are kept, but every character on them is live data rather than a
    model name. */
-#define LEGEND_HEIGHT 14
+/* Pebble Time 2 (emery): 200 x 228. Chrome takes 18 top and 18 bottom, the
+   glass is inset 4 a side, so the panel is exactly 192 x 192 — which divides
+   into four 48px rows with nothing left over. */
+#if PBL_DISPLAY_WIDTH != 200 || PBL_DISPLAY_HEIGHT != 228
+#error "Laid out for Pebble Time 2 (emery, 200x228)"
+#endif
+#define SCREEN_W PBL_DISPLAY_WIDTH
+#define SCREEN_H PBL_DISPLAY_HEIGHT
+#define LEGEND_HEIGHT 16
 #define RAIL_HEIGHT 2
 #define TOP_CHROME (LEGEND_HEIGHT + RAIL_HEIGHT)
 #define BOTTOM_CHROME (LEGEND_HEIGHT + RAIL_HEIGHT)
-#ifdef PBL_ROUND
-#define PANEL_INSET 16
-#else
-#define PANEL_INSET 3
-#endif
-#define ROW_HEIGHT 40
-#define SECTION_HEADER_HEIGHT 15
+#define PANEL_INSET 4
+#define PANEL_W (SCREEN_W - 2 * PANEL_INSET)
+#define PANEL_H (SCREEN_H - TOP_CHROME - BOTTOM_CHROME)
+#define GLASS_PAD 8
+#define ROW_HEIGHT 48
+#define SECTION_HEADER_HEIGHT 18
 #define CARD_PAD 8
 
 #define STREAM_TICK_MS 110
@@ -87,7 +113,9 @@ typedef struct {
   char state[10];
   char request_id[72];
   char request_kind[12];
+  char agent[32];
   char summary[180];
+  bool settled;
 } SessionItem;
 
 typedef struct {
@@ -98,8 +126,41 @@ typedef struct {
 
 typedef enum {
   DictationTargetSession,
-  DictationTargetProject
+  DictationTargetProject,
+  DictationTargetNewProject,
+  DictationTargetConcierge
 } DictationTarget;
+
+/* Rows that sit under the thread list and lead somewhere rather than opening a
+   thread. Which ones exist depends on the scope and on how much is left to
+   page through, so they are rebuilt whenever a listing lands. */
+typedef enum {
+  FooterScopeSettled,
+  FooterScopeActive,
+  FooterMore
+} FooterKind;
+
+/* What an action menu entry does. Stored as the item's action data. */
+typedef enum {
+  ActionReply = 1,
+  ActionSettle,
+  ActionUnsettle,
+  ActionInterrupt,
+  ActionCreateProject
+} ActionKind;
+
+/* Thread-list scope and paging state, all reported by the phone alongside a
+   listing so the footer rows can be labelled without a second request. */
+static int s_scope;
+static int s_offset;
+static int s_matched;
+static int s_other;
+static FooterKind s_footers[2];
+static int s_footer_count;
+
+/* A project path proposed by the phone, held while the user confirms it. */
+static char s_pending_project_path[160];
+static char s_pending_project_name[48];
 
 static Window *s_host_window;
 static Window *s_thread_window;
@@ -148,7 +209,6 @@ static bool s_hosts_synced;
 static bool s_threads_synced;
 static bool s_showing_context;
 static bool s_context_loading;
-static bool s_context_page_nav;
 static bool s_sending_message;
 static bool s_link_down;
 static time_t s_last_sync;
@@ -225,9 +285,9 @@ static GColor lcd_glass(void) {
    further by the hatch. */
 static GColor lcd_ghost_tone(void) {
 #ifdef PBL_COLOR
-  return GColorLightGray;
+  return GColorPastelYellow;
 #else
-  return GColorWhite;
+  return GColorBlack;
 #endif
 }
 
@@ -255,14 +315,17 @@ static GColor legend(void) {
 #endif
 }
 
+/* Red on the black chassis has to be bright to read; the same red on the pale
+   glass has to be dark. One value cannot do both jobs. */
 static GColor rule_color(void) {
 #ifdef PBL_COLOR
-  return GColorDarkCandyAppleRed;
+  return GColorFolly;
 #else
   return GColorWhite;
 #endif
 }
 
+/* Alerts drawn on the glass: dark enough to hold against the substrate. */
 static GColor alert_color(void) {
 #ifdef PBL_COLOR
   return GColorDarkCandyAppleRed;
@@ -271,9 +334,16 @@ static GColor alert_color(void) {
 #endif
 }
 
+/* Anything highlighted on the glass uses ink, never a chassis legend colour:
+   light blue on a pale substrate is unreadable, and on the monochrome watches
+   the legend colour is white, which disappears entirely. */
+static GColor glass_accent(void) {
+  return GColorBlack;
+}
+
 static GColor active_color(void) {
 #ifdef PBL_COLOR
-  return GColorCobaltBlue;
+  return GColorDukeBlue;
 #else
   return GColorBlack;
 #endif
@@ -440,6 +510,46 @@ static void schedule_refresh(uint32_t delay_ms) {
 
 /* -------------------------------------------------- reference primitives */
 
+/* Pebble draws text from the top of the layout box, which sits above the cap
+   height by the font's internal leading — so hand-tuned negative offsets were
+   guesses that only held for one font at one size. These measure the glyph box
+   and place it exactly, which is what makes the result repeatable. */
+typedef struct {
+  int top;   /* rows between the layout box top and the first inked row */
+  int height; /* inked rows for upper-case text */
+} InkBox;
+
+/* Measured from watch screenshots, not guessed: Share Tech Mono at 16 inks
+   rows 7..14 of its layout box, and at 20 rows 9..18. */
+static const InkBox INK_TECH_16 = { 7, 8 };
+static const InkBox INK_TECH_20 = { 9, 10 };
+
+static InkBox ink_for(GFont font) {
+  return font == s_font_tech ? INK_TECH_20 : INK_TECH_16;
+}
+
+/* Places text so its inked rows are centred in `box`. */
+static int ink_origin_y(GRect box, GFont font) {
+  InkBox ink = ink_for(font);
+  return box.origin.y + (box.size.h - ink.height) / 2 - ink.top;
+}
+
+static GSize measure(const char *text, GFont font) {
+  return graphics_text_layout_get_content_size(text, font, GRect(0, 0, SCREEN_W, SCREEN_H),
+                                               GTextOverflowModeTrailingEllipsis,
+                                               GTextAlignmentLeft);
+}
+
+/* Draws `text` vertically centred inside `box`, left-aligned at box.x. */
+static void draw_text_v(GContext *ctx, const char *text, GFont font, GRect box,
+                        GTextAlignment align) {
+  GSize size = measure(text, font);
+  int y = box.origin.y + (box.size.h - size.h) / 2;
+  graphics_draw_text(ctx, text, font, GRect(box.origin.x, y, box.size.w, size.h + 2),
+                     GTextOverflowModeTrailingEllipsis, align, NULL);
+}
+
+
 /* Two 1-bit tiles do all the LCD texture work, blitted rather than drawn
    pixel by pixel: a stipple that gives the substrate its panel grain, and a
    hatch that knocks unlit segments back so they read as texture instead of
@@ -495,6 +605,12 @@ static void hatch_rect(GContext *ctx, GRect r) {
 }
 
 static void stipple_rect(GContext *ctx, GRect r) {
+#ifndef PBL_COLOR
+  /* On a 1-bit panel a dot grid is noise, not texture: the substrate is
+     already the brightest thing available. */
+  (void)r;
+  return;
+#endif
   if (!s_stipple) {
     return;
   }
@@ -517,41 +633,31 @@ static void draw_panel_bevel(GContext *ctx, GRect panel) {
                      GPoint(panel.origin.x + panel.size.w - 2, panel.origin.y + panel.size.h - 3));
 }
 
-/* Legends on the reference are letter-spaced small caps. Pebble offers no
-   tracking control, so the string is stepped one glyph at a time. */
+/* Labels are drawn as whole strings.
+
+   These used to render glyph by glyph to fake letter-spacing, stepping by each
+   character's measured width. That was the cause of the uneven, clipped text:
+   every glyph was re-positioned and re-clipped into its own box, so stems were
+   cut and the pitch wandered. Share Tech Mono is already a fixed-pitch
+   technical face — it does not need faked tracking, and one draw call per
+   string is both correct and cheaper. The `tracking` argument is retained so
+   call sites did not all have to change; it is deliberately ignored. */
 static int tracked_width(const char *text, GFont font, int tracking) {
-  char glyph[2] = { 0, 0 };
-  int width = 0;
-  for (const char *c = text; *c; c++) {
-    if (*c == ' ') {
-      width += 4 + tracking;
-      continue;
-    }
-    glyph[0] = *c;
-    GSize size = graphics_text_layout_get_content_size(glyph, font, GRect(0, 0, 40, 20),
-                                                       GTextOverflowModeTrailingEllipsis,
-                                                       GTextAlignmentLeft);
-    width += size.w + tracking;
-  }
-  return width;
+  (void)tracking;
+  return measure(text, font).w;
+}
+
+static void draw_tracked_max(GContext *ctx, const char *text, GFont font, GPoint origin,
+                             int tracking, int max_w) {
+  (void)tracking;
+  GSize size = measure(text, font);
+  int w = max_w > 0 ? max_w : size.w + 2;
+  graphics_draw_text(ctx, text, font, GRect(origin.x, origin.y, w, size.h + 2),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
 static void draw_tracked(GContext *ctx, const char *text, GFont font, GPoint origin, int tracking) {
-  char glyph[2] = { 0, 0 };
-  int x = origin.x;
-  for (const char *c = text; *c; c++) {
-    if (*c == ' ') {
-      x += 4 + tracking;
-      continue;
-    }
-    glyph[0] = *c;
-    GSize size = graphics_text_layout_get_content_size(glyph, font, GRect(0, 0, 40, 20),
-                                                       GTextOverflowModeTrailingEllipsis,
-                                                       GTextAlignmentLeft);
-    graphics_draw_text(ctx, glyph, font, GRect(x, origin.y, size.w + 6, 18),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-    x += size.w + tracking;
-  }
+  draw_tracked_max(ctx, text, font, origin, tracking, 0);
 }
 
 /* The crimson rails bracket the glass and taper toward the buttons, the way
@@ -624,7 +730,7 @@ static GSize seg_block_size(int digits, bool big) {
 
 /* A BAT-style segmented meter. The reference spends this on battery; here it
    carries how much of the list is behind you, so the band stays useful. */
-static void draw_segment_meter(GContext *ctx, GPoint origin, int height, int filled, int total) {
+static void draw_segment_meter(GContext *ctx, GPoint origin, int height, int filled, int total, GColor on) {
   int cells = 6;
   int cell_w = 3;
   int gap = 2;
@@ -636,20 +742,20 @@ static void draw_segment_meter(GContext *ctx, GPoint origin, int height, int fil
     lit = 1;
   }
   for (int i = 0; i < cells; i++) {
-    graphics_context_set_fill_color(ctx, i < lit ? legend() : lcd_dim());
+    graphics_context_set_fill_color(ctx, i < lit ? on : lcd_dim());
     graphics_fill_rect(ctx, GRect(origin.x + i * (cell_w + gap), origin.y, cell_w, height), 0, GCornerNone);
   }
 }
 
 /* The day strip, reused as a host strip: one square per configured machine,
    the one in view filled in. */
-static void draw_host_strip(GContext *ctx, GPoint origin, int count, int current) {
+static void draw_host_strip(GContext *ctx, GPoint origin, int count, int current, GColor on) {
   int cell = 5;
   int gap = 3;
   for (int i = 0; i < count && i < MAX_HOSTS; i++) {
     GRect mark = GRect(origin.x + i * (cell + gap), origin.y, cell, cell);
-    graphics_context_set_stroke_color(ctx, legend());
-    graphics_context_set_fill_color(ctx, legend());
+    graphics_context_set_stroke_color(ctx, on);
+    graphics_context_set_fill_color(ctx, on);
     if (i == current) {
       graphics_fill_rect(ctx, mark, 0, GCornerNone);
     } else {
@@ -682,51 +788,54 @@ static void draw_field_box(GContext *ctx, GRect box) {
 }
 
 static void draw_legend_band(GContext *ctx, GRect bounds, const char *left, const char *right) {
-  graphics_context_set_text_color(ctx, legend());
-  if (left && left[0]) {
-    draw_tracked(ctx, left, font_legend(), GPoint(6, -3), 1);
-  }
-  /* A fault count rides the top band in crimson so it is visible from every
-     screen without covering anything. */
+  /* Right-hand fields are laid out first and the left label is bounded by what
+     remains, so a long name can never run under the counters. */
+  int right_edge = bounds.size.w - GLASS_PAD;
+  int band_y = ink_origin_y(GRect(0, 0, 0, LEGEND_HEIGHT), font_legend());
   char tail[24];
+
   if (s_error_total > 0) {
     snprintf(tail, sizeof(tail), "ERR%d", s_error_total);
     int ew = tracked_width(tail, font_legend(), 1);
     graphics_context_set_text_color(ctx, rule_color());
-    draw_tracked(ctx, tail, font_legend(), GPoint(bounds.size.w - 6 - ew, -3), 1);
-    if (right && right[0]) {
-      int w = tracked_width(right, font_legend(), 1);
-      graphics_context_set_text_color(ctx, legend());
-      draw_tracked(ctx, right, font_legend(), GPoint(bounds.size.w - 12 - ew - w, -3), 1);
-    }
-    return;
+    draw_tracked(ctx, tail, font_legend(), GPoint(right_edge - ew, band_y), 1);
+    right_edge -= ew + 6;
   }
   if (right && right[0]) {
     int w = tracked_width(right, font_legend(), 1);
-    draw_tracked(ctx, right, font_legend(), GPoint(bounds.size.w - 6 - w, -3), 1);
+    graphics_context_set_text_color(ctx, legend());
+    draw_tracked(ctx, right, font_legend(), GPoint(right_edge - w, band_y), 1);
+    right_edge -= w + 6;
+  }
+  if (left && left[0]) {
+    graphics_context_set_text_color(ctx, legend());
+    draw_tracked_max(ctx, left, font_legend(), GPoint(GLASS_PAD, band_y), 1, right_edge - GLASS_PAD);
   }
 }
 
 /* The bottom band: normally a legend, but a live fault takes it over in
    crimson the way MONITOR does on the reference. */
 static void draw_bottom_band(GContext *ctx, GRect bounds, const char *left, const char *right) {
-  int y = bounds.size.h - BOTTOM_CHROME + 1;
+  GRect band = GRect(GLASS_PAD, bounds.size.h - BOTTOM_CHROME + RAIL_HEIGHT,
+                     bounds.size.w - 2 * GLASS_PAD, LEGEND_HEIGHT - RAIL_HEIGHT);
+  int y = ink_origin_y(band, font_legend());
   if (s_error_active && s_error_log_count > 0) {
     graphics_context_set_text_color(ctx, rule_color());
-    draw_tracked(ctx, "ERR", font_legend(), GPoint(6, y), 1);
+    draw_tracked(ctx, "ERR", font_legend(), GPoint(band.origin.x, y), 1);
+    int lead = tracked_width("ERR", font_legend(), 1) + 6;
     graphics_context_set_text_color(ctx, legend());
-    graphics_draw_text(ctx, s_error_log[0], fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                       GRect(30, y - 2, bounds.size.w - 36, 16),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    draw_text_v(ctx, s_error_log[0], font_row_detail(),
+                GRect(band.origin.x + lead, band.origin.y, band.size.w - lead, band.size.h),
+                GTextAlignmentLeft);
     return;
   }
   graphics_context_set_text_color(ctx, legend());
   if (left && left[0]) {
-    draw_tracked(ctx, left, font_legend(), GPoint(6, y), 1);
+    draw_tracked(ctx, left, font_legend(), GPoint(band.origin.x, y), 1);
   }
   if (right && right[0]) {
     int w = tracked_width(right, font_legend(), 1);
-    draw_tracked(ctx, right, font_legend(), GPoint(bounds.size.w - 6 - w, y), 1);
+    draw_tracked(ctx, right, font_legend(), GPoint(band.origin.x + band.size.w - w, y), 1);
   }
 }
 
@@ -734,7 +843,7 @@ static void draw_bottom_band(GContext *ctx, GRect bounds, const char *left, cons
    nothing extra has to appear on screen. */
 static void draw_busy_rail(GContext *ctx, GRect bounds, int y) {
   graphics_context_set_fill_color(ctx, chassis());
-  graphics_fill_rect(ctx, GRect(0, y - 3, bounds.size.w, RAIL_HEIGHT + 6), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(0, y - 4, bounds.size.w, RAIL_HEIGHT + 4), 0, GCornerNone);
   int span = bounds.size.w - 14;
   int phase = s_stream_phase % 40;
   int t = phase < 20 ? phase : 40 - phase;
@@ -876,7 +985,7 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
   int tw = tracked_width(title, font_legend(), 2);
   draw_tracked(ctx, title, font_legend(), GPoint(panel.origin.x + (panel.size.w - tw) / 2, y + 3), 2);
 
-  graphics_context_set_text_color(ctx, lcd_dim());
+  graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, hint, font_row_detail(),
                      GRect(panel.origin.x + 6, y + 20, panel.size.w - 12, 34),
                      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
@@ -887,7 +996,7 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
   snprintf(foot, sizeof(foot), "%s  SYN %s", BUILD_LABEL, age);
   int fw = tracked_width(foot, font_row_detail(), 1);
   draw_caption(ctx, foot, GPoint(panel.origin.x + (panel.size.w - fw) / 2,
-                                 panel.origin.y + panel.size.h - 17), lcd_dim());
+                                 panel.origin.y + panel.size.h - 17), lcd_ink());
 }
 
 static void host_layer_update_proc(Layer *layer, GContext *ctx) {
@@ -936,27 +1045,36 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
      caption under every field rather than letting a value stand alone. */
   graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, host->title, font_row_title(),
-                     GRect(inner_x, panel.origin.y + 2, inner_w - 66, 20),
+                     GRect(inner_x, panel.origin.y + 2, inner_w, 20),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
   char sub[28];
   snprintf(sub, sizeof(sub), "%d THREAD%s", total, total == 1 ? "" : "S");
-  draw_caption(ctx, sub, GPoint(inner_x, panel.origin.y + 19), lcd_dim());
+  draw_caption(ctx, sub, GPoint(inner_x, panel.origin.y + 19), lcd_ink());
 
-  /* Field two: the boxed complication, ghosted segments with their own
-     captions so the three numbers are readable rather than decorative. */
-  GRect field = GRect(panel.origin.x + panel.size.w - 64, panel.origin.y + 3, 57, 33);
+  /* Field two: the boxed complication, on its own full-width row. It was laid
+     out on a guessed pitch before, which overlapped the digits and spilled them
+     out of the box; the pitch is now measured from the font, which is the only
+     thing that can be right across three screen sizes. */
+  GSize seg2 = seg_block_size(2, false);
+  int cap_w = 11;
+  int cell_w = cap_w + seg2.w;
+  int slack = inner_w - 3 * cell_w;
+  int gap = slack > 0 ? slack / 4 : 2;
+  GRect field = GRect(inner_x, panel.origin.y + 33, inner_w, seg2.h + 6);
   draw_field_box(ctx, field);
+
   int trio[3] = { host->run, host->idle, host->settled };
   const char *trio_caps[3] = { "R", "I", "S" };
   for (int i = 0; i < 3; i++) {
-    draw_seg_value(ctx, GPoint(field.origin.x + 6 + i * 17, field.origin.y + 2),
+    int cell_x = field.origin.x + gap + i * (cell_w + gap);
+    draw_caption(ctx, trio_caps[i], GPoint(cell_x, field.origin.y + 2), lcd_ink());
+    draw_seg_value(ctx, GPoint(cell_x + cap_w, field.origin.y + 3),
                    clamp_int(trio[i], 0, 99), 2, lcd_ink(), false);
-    draw_caption(ctx, trio_caps[i], GPoint(field.origin.x + 9 + i * 17, field.origin.y + 16), lcd_dim());
   }
 
   /* Field three: the headline. One big segment readout, the way the time
      dominates the reference, with two caption lines beside it. */
-  int big_y = panel.origin.y + 42;
+  int big_y = field.origin.y + field.size.h + 6;
   GColor ink = state_color(host->state);
   if (gcolor_equal(ink, lcd_dim())) {
     ink = lcd_ink();
@@ -976,10 +1094,10 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   } else {
     char of_line[24];
     snprintf(of_line, sizeof(of_line), "OF %d", total);
-    draw_caption(ctx, of_line, GPoint(label_x, big_y + 17), lcd_dim());
+    draw_caption(ctx, of_line, GPoint(label_x, big_y + 17), lcd_ink());
   }
   draw_caption(ctx, state_is(host->state, "offline") ? "TAP RETRY" : "TAP OPEN",
-               GPoint(label_x, big_y + 30), lcd_dim());
+               GPoint(label_x, big_y + 30), lcd_ink());
 
   if (state_is_live(host->state) || state_is(host->state, "needs")) {
     draw_state_mark(ctx, GRect(panel.origin.x + panel.size.w - 15, big_y + 4, 7, 7), host->state, false);
@@ -991,17 +1109,17 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   graphics_context_set_fill_color(ctx, lcd_dim());
   graphics_fill_rect(ctx, GRect(inner_x, strip_y - 5, inner_w, 1), 0, GCornerNone);
 
-  draw_caption(ctx, "ACT", GPoint(inner_x, strip_y - 4), lcd_dim());
-  draw_segment_meter(ctx, GPoint(inner_x + 24, strip_y + 2), 7, total - host->settled, total);
+  draw_caption(ctx, "ACT", GPoint(inner_x, strip_y - 4), lcd_ink());
+  draw_segment_meter(ctx, GPoint(inner_x + 24, strip_y + 2), 7, total - host->settled, total, glass_accent());
 
   char age[12];
   sync_age_text(age, sizeof(age));
   char sync_line[20];
   snprintf(sync_line, sizeof(sync_line), "SYN %s", age);
-  draw_caption(ctx, sync_line, GPoint(inner_x + 62, strip_y - 4), lcd_dim());
+  draw_caption(ctx, sync_line, GPoint(inner_x + 62, strip_y - 4), lcd_ink());
 
   draw_host_strip(ctx, GPoint(panel.origin.x + panel.size.w - 8 - s_host_count * 8, strip_y + 1),
-                  s_host_count, s_host_cursor);
+                  s_host_count, s_host_cursor, glass_accent());
 
   draw_bottom_band(ctx, bounds, "HOST", "OPEN");
 }
@@ -1043,24 +1161,38 @@ static void host_click_config(void *context) {
   window_long_click_subscribe(BUTTON_ID_SELECT, 0, host_select_long, NULL);
 }
 
-static void open_selected_host(void) {
-  s_selected_host_index = clamp_int(s_host_cursor, 0, s_host_count - 1);
+/* Asks the phone for one page of one scope. The list is cleared first so a
+   stale page is never left on the glass while the next one is in flight. */
+static void request_host_threads(int scope, int offset) {
+  s_scope = scope;
+  s_offset = offset < 0 ? 0 : offset;
   s_session_count = 0;
   s_project_count = 0;
+  s_footer_count = 0;
   s_threads_synced = false;
   s_loading_threads = true;
-  window_stack_push(s_thread_window, true);
   update_stream_timer();
+  mark_all_dirty();
 
   DictionaryIterator *iter = NULL;
   if (app_message_outbox_begin(&iter) != APP_MSG_OK || !iter) {
+    log_error("Phone link busy");
     set_status("Phone link busy");
     return;
   }
   int command = CMD_SELECT_HOST;
   dict_write_int(iter, KEY_CMD, &command, sizeof(command), true);
   dict_write_cstring(iter, KEY_HOST_ID, s_hosts[s_selected_host_index].id);
+  dict_write_int(iter, KEY_SCOPE, &s_scope, sizeof(s_scope), true);
+  dict_write_int(iter, KEY_OFFSET, &s_offset, sizeof(s_offset), true);
   app_message_outbox_send();
+}
+
+static void open_selected_host(void) {
+  s_selected_host_index = clamp_int(s_host_cursor, 0, s_host_count - 1);
+  window_stack_push(s_thread_window, true);
+  /* A host always opens on the work that still wants something. */
+  request_host_threads(SCOPE_ACTIVE, 0);
 }
 
 /* ------------------------------------------------------------ diagnostics */
@@ -1092,7 +1224,7 @@ static void diag_layer_update_proc(Layer *layer, GContext *ctx) {
   y += 15;
 
   snprintf(line, sizeof(line), "HOSTS %d   THR %d   SYN %s", s_host_count, s_session_count, age);
-  draw_caption(ctx, line, GPoint(x, y), lcd_dim());
+  draw_caption(ctx, line, GPoint(x, y), lcd_ink());
   y += 14;
 
   graphics_context_set_fill_color(ctx, lcd_dim());
@@ -1100,12 +1232,12 @@ static void diag_layer_update_proc(Layer *layer, GContext *ctx) {
   y += 4;
 
   if (s_error_log_count == 0) {
-    draw_caption(ctx, "NO FAULTS LOGGED", GPoint(x, y + 4), lcd_dim());
+    draw_caption(ctx, "NO FAULTS LOGGED", GPoint(x, y + 4), lcd_ink());
   } else {
     for (int i = 0; i < s_error_log_count && y < panel.origin.y + panel.size.h - 16; i++) {
       char idx[6];
       snprintf(idx, sizeof(idx), "%d", s_error_total - i);
-      graphics_context_set_text_color(ctx, rule_color());
+      graphics_context_set_text_color(ctx, alert_color());
       draw_tracked(ctx, idx, font_legend(), GPoint(x, y - 2), 1);
       graphics_context_set_text_color(ctx, lcd_ink());
       graphics_draw_text(ctx, s_error_log[i], fonts_get_system_font(FONT_KEY_GOTHIC_14),
@@ -1166,7 +1298,7 @@ static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
                      GRect(19, 0, bounds.size.w - 25, 21),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  graphics_context_set_text_color(ctx, selected ? lcd_glass() : lcd_dim());
+  graphics_context_set_text_color(ctx, selected ? lcd_glass() : lcd_ink());
   graphics_draw_text(ctx, detail, font_row_detail(),
                      GRect(19, 19, bounds.size.w - 25, 17),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
@@ -1214,8 +1346,52 @@ static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
   draw_bottom_band(ctx, bounds, tally, "");
   if (!s_error_active) {
     draw_host_strip(ctx, GPoint(bounds.size.w - 8 - s_host_count * 8, bounds.size.h - BOTTOM_CHROME + 5),
-                    s_host_count, s_selected_host_index);
+                    s_host_count, s_selected_host_index, legend());
   }
+}
+
+/* Footer rows are derived, never stored by the phone: which ones apply follows
+   from the scope and from whether this page is the last one. */
+static void rebuild_footers(void) {
+  s_footer_count = 0;
+  if (!s_threads_synced || s_loading_threads) {
+    return;
+  }
+  if (s_scope == SCOPE_ACTIVE) {
+    if (s_other > 0) {
+      s_footers[s_footer_count++] = FooterScopeSettled;
+    }
+    return;
+  }
+  if (s_offset + s_session_count < s_matched) {
+    s_footers[s_footer_count++] = FooterMore;
+  }
+  s_footers[s_footer_count++] = FooterScopeActive;
+}
+
+/* Rows in section 0 that are threads rather than footers. The empty list still
+   occupies one row, so the footers always sit below something. */
+static int thread_body_rows(void) {
+  if (!s_threads_synced || s_loading_threads) {
+    return GHOST_ROWS;
+  }
+  return s_session_count > 0 ? s_session_count : 1;
+}
+
+static void footer_label(FooterKind kind, char *out, size_t out_size) {
+  switch (kind) {
+    case FooterScopeSettled:
+      snprintf(out, out_size, "SETTLED %d", s_other);
+      return;
+    case FooterScopeActive:
+      snprintf(out, out_size, "ACTIVE %d", s_other);
+      return;
+    case FooterMore:
+      snprintf(out, out_size, "MORE %d OF %d",
+               s_offset + s_session_count, s_matched);
+      return;
+  }
+  out[0] = '\0';
 }
 
 static uint16_t thread_num_sections(MenuLayer *menu_layer, void *data) {
@@ -1224,12 +1400,10 @@ static uint16_t thread_num_sections(MenuLayer *menu_layer, void *data) {
 
 static uint16_t thread_num_rows(MenuLayer *menu_layer, uint16_t section_index, void *data) {
   if (section_index == 1) {
-    return (!s_threads_synced || s_loading_threads) ? 0 : s_project_count;
+    /* One row past the projects is the way to make a new one. */
+    return (!s_threads_synced || s_loading_threads) ? 0 : s_project_count + 1;
   }
-  if (!s_threads_synced || s_loading_threads) {
-    return GHOST_ROWS;
-  }
-  return s_session_count > 0 ? s_session_count : 1;
+  return thread_body_rows() + s_footer_count;
 }
 
 static int16_t thread_header_height(MenuLayer *menu_layer, uint16_t section_index, void *data) {
@@ -1247,7 +1421,8 @@ static void thread_draw_header(GContext *ctx, const Layer *cell_layer, uint16_t 
   graphics_context_set_fill_color(ctx, lcd_ink());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
   graphics_context_set_text_color(ctx, lcd_glass());
-  draw_tracked(ctx, "START NEW", font_legend(), GPoint(6, -4), 1);
+  draw_tracked(ctx, "START NEW", font_legend(),
+               GPoint(GLASS_PAD, ink_origin_y(bounds, font_legend())), 1);
 }
 
 static bool thread_list_is_empty(void) {
@@ -1267,11 +1442,29 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
   bool selected = menu_layer_is_index_selected(s_thread_menu, cell_index);
 
   if (cell_index->section == 1) {
-    if (cell_index->row >= s_project_count) {
+    if (cell_index->row == s_project_count) {
+      draw_list_row(ctx, cell_layer, selected, "New project", "dictate a name", "empty");
+      return;
+    }
+    if (cell_index->row > s_project_count) {
       return;
     }
     ProjectItem *project = &s_projects[cell_index->row];
     draw_list_row(ctx, cell_layer, selected, project->title, project->directory, "idle");
+    return;
+  }
+
+  /* Footer rows sit past the threads and lead elsewhere rather than opening
+     one, so they are drawn before the thread cases below. */
+  int body = thread_body_rows();
+  if (s_threads_synced && !s_loading_threads && cell_index->row >= body) {
+    int footer = cell_index->row - body;
+    if (footer < s_footer_count) {
+      char label[24];
+      footer_label(s_footers[footer], label, sizeof(label));
+      draw_list_row(ctx, cell_layer, selected, label,
+                    s_footers[footer] == FooterMore ? "next page" : "switch list", "empty");
+    }
     return;
   }
 
@@ -1297,9 +1490,26 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
   draw_list_row(ctx, cell_layer, selected, item->title, item->detail, item->state);
 }
 
+/* Holding the new-project row describes a location instead of naming one: the
+   concierge agent works out the path and it comes back to the same confirm. */
+static void thread_select_long(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
+  if (cell_index->section != 1 || cell_index->row != s_project_count) {
+    return;
+  }
+  s_dictation_target = DictationTargetConcierge;
+  set_status("Describe where");
+  start_dictation();
+}
+
 static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
   if (cell_index->section == 1) {
-    if (cell_index->row >= s_project_count) {
+    if (cell_index->row == s_project_count) {
+      s_dictation_target = DictationTargetNewProject;
+      set_status("Name the project");
+      start_dictation();
+      return;
+    }
+    if (cell_index->row > s_project_count) {
       return;
     }
     s_selected_project_index = cell_index->row;
@@ -1309,13 +1519,32 @@ static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *da
     return;
   }
 
+  int body = thread_body_rows();
+  if (s_threads_synced && !s_loading_threads && cell_index->row >= body) {
+    int footer = cell_index->row - body;
+    if (footer >= s_footer_count) {
+      return;
+    }
+    switch (s_footers[footer]) {
+      case FooterScopeSettled:
+        request_host_threads(SCOPE_SETTLED, 0);
+        return;
+      case FooterScopeActive:
+        request_host_threads(SCOPE_ACTIVE, 0);
+        return;
+      case FooterMore:
+        request_host_threads(s_scope, s_offset + s_session_count);
+        return;
+    }
+    return;
+  }
+
   if (!s_threads_synced || s_session_count == 0 || cell_index->row >= s_session_count) {
     return;
   }
   s_selected_index = cell_index->row;
   s_showing_context = false;
   s_context_loading = false;
-  s_context_page_nav = false;
   s_pending_context_session_id[0] = '\0';
   s_pending_context_request_id[0] = '\0';
   s_full_context[0] = '\0';
@@ -1361,7 +1590,6 @@ static void request_detail(int index, bool full_context) {
   }
   s_showing_context = false;
   s_context_loading = false;
-  s_context_page_nav = false;
   s_detail_loading = true;
   s_pending_context_session_id[0] = '\0';
   s_pending_context_request_id[0] = '\0';
@@ -1379,6 +1607,146 @@ static void request_detail(int index, bool full_context) {
   dict_write_int(iter, KEY_INDEX, &index, sizeof(index), true);
   dict_write_cstring(iter, KEY_SESSION_ID, s_sessions[index].id);
   app_message_outbox_send();
+}
+
+/* Settle, unsettle and interrupt all name the selected thread and differ only
+   in the verb, so they share one message. */
+static void send_thread_action(const char *action) {
+  if (s_selected_index < 0 || s_selected_index >= s_session_count) {
+    return;
+  }
+  DictionaryIterator *iter = NULL;
+  send_command_begin(&iter, CMD_THREAD_ACTION);
+  if (!iter) {
+    return;
+  }
+  dict_write_cstring(iter, KEY_SESSION_ID, s_sessions[s_selected_index].id);
+  dict_write_cstring(iter, KEY_ACTION, action);
+  app_message_outbox_send();
+}
+
+static void send_project_create(void) {
+  if (!s_pending_project_path[0]) {
+    return;
+  }
+  DictionaryIterator *iter = NULL;
+  send_command_begin(&iter, CMD_PROJECT_CREATE);
+  if (!iter) {
+    return;
+  }
+  dict_write_cstring(iter, KEY_HOST_ID, s_hosts[s_selected_host_index].id);
+  dict_write_cstring(iter, KEY_NAME, s_pending_project_name);
+  dict_write_cstring(iter, KEY_PATH, s_pending_project_path);
+  app_message_outbox_send();
+  s_pending_project_path[0] = '\0';
+  s_pending_project_name[0] = '\0';
+}
+
+/* A dictated name is only a proposal: the phone turns it into an absolute path
+   and sends it back for confirmation before anything is created. */
+static void send_project_name(const char *name) {
+  if (s_selected_host_index < 0 || s_selected_host_index >= s_host_count) {
+    return;
+  }
+  DictionaryIterator *iter = NULL;
+  send_command_begin(&iter, CMD_PROJECT_NAME);
+  if (!iter) {
+    return;
+  }
+  dict_write_cstring(iter, KEY_HOST_ID, s_hosts[s_selected_host_index].id);
+  dict_write_cstring(iter, KEY_NAME, name);
+  app_message_outbox_send();
+}
+
+/* For when the location is easier described than dictated. An agent in the
+   configured project proposes the path; confirmation still happens here. */
+static void send_concierge_text(const char *text) {
+  if (s_selected_host_index < 0 || s_selected_host_index >= s_host_count) {
+    return;
+  }
+  DictionaryIterator *iter = NULL;
+  send_command_begin(&iter, CMD_CONCIERGE);
+  if (!iter) {
+    return;
+  }
+  dict_write_cstring(iter, KEY_HOST_ID, s_hosts[s_selected_host_index].id);
+  dict_write_cstring(iter, KEY_PROMPT, text);
+  app_message_outbox_send();
+}
+
+/* The second parameter is the performed item, not the root level, whatever the
+   SDK's doc comment says, so the level to free is carried in the context. */
+static void action_menu_closed(ActionMenu *menu, const ActionMenuItem *performed, void *context) {
+  action_menu_hierarchy_destroy((const ActionMenuLevel *)context, NULL, NULL);
+}
+
+static void perform_action(ActionMenu *menu, const ActionMenuItem *action, void *context) {
+  switch ((ActionKind)(uintptr_t)action_menu_item_get_action_data(action)) {
+    case ActionReply:
+      s_dictation_target = DictationTargetSession;
+      start_dictation();
+      return;
+    case ActionSettle:
+      set_status("Settling");
+      send_thread_action("settle");
+      return;
+    case ActionUnsettle:
+      set_status("Reopening");
+      send_thread_action("unsettle");
+      return;
+    case ActionInterrupt:
+      set_status("Interrupting");
+      send_thread_action("interrupt");
+      return;
+    case ActionCreateProject:
+      set_status("Creating project");
+      send_project_create();
+      return;
+  }
+}
+
+static void open_action_menu(ActionMenuLevel *level) {
+  ActionMenuConfig config = (ActionMenuConfig) {
+    .root_level = level,
+    .context = level,
+    .colors = { .background = legend(), .foreground = lcd_ink() },
+    .did_close = action_menu_closed,
+    .align = ActionMenuAlignCenter
+  };
+  action_menu_open(&config);
+}
+
+/* Built per thread so it only ever offers what applies: a settled thread can
+   be reopened but not settled again, and vice versa. */
+static void open_thread_actions(void) {
+  if (s_selected_index < 0 || s_selected_index >= s_session_count) {
+    return;
+  }
+  ActionMenuLevel *level = action_menu_level_create(3);
+  if (!level) {
+    log_error("Out of memory");
+    return;
+  }
+  action_menu_level_add_action(level, "Reply", perform_action, (void *)(uintptr_t)ActionReply);
+  if (s_sessions[s_selected_index].settled) {
+    action_menu_level_add_action(level, "Unsettle", perform_action, (void *)(uintptr_t)ActionUnsettle);
+  } else {
+    action_menu_level_add_action(level, "Settle", perform_action, (void *)(uintptr_t)ActionSettle);
+    action_menu_level_add_action(level, "Interrupt", perform_action, (void *)(uintptr_t)ActionInterrupt);
+  }
+  open_action_menu(level);
+}
+
+/* The confirm gate for a dictated project: the phone has resolved a path, and
+   nothing is created until this menu is answered. */
+static void open_project_confirm(void) {
+  ActionMenuLevel *level = action_menu_level_create(1);
+  if (!level) {
+    log_error("Out of memory");
+    return;
+  }
+  action_menu_level_add_action(level, "Create", perform_action, (void *)(uintptr_t)ActionCreateProject);
+  open_action_menu(level);
 }
 
 static void request_context_page(int page) {
@@ -1545,7 +1913,7 @@ static int detail_content_height_for_width(int width) {
   }
   SessionItem *item = &s_sessions[s_selected_index];
   const char *summary = item->summary[0] ? item->summary : "No summary yet.";
-  int height = 24 + text_height(summary, font_body(), width - 20) + 48;
+  int height = 42 + text_height(summary, font_body(), width - 20) + 48;
   return clamp_int(height, DETAIL_CONTENT_MIN_HEIGHT, DETAIL_CONTENT_HEIGHT);
 }
 
@@ -1571,7 +1939,7 @@ static int draw_context_card(GContext *ctx, int y, int width, const char *role, 
   graphics_context_set_fill_color(ctx, from_user ? lcd_ink() : lcd_dim());
   graphics_fill_rect(ctx, GRect(6, y + 2, 2, card_h - 8), 0, GCornerNone);
 
-  graphics_context_set_text_color(ctx, lcd_dim());
+  graphics_context_set_text_color(ctx, lcd_ink());
   draw_tracked(ctx, from_user ? "YOU" : "AGENT", font_legend(), GPoint(13, y - 4), 1);
 
   graphics_context_set_text_color(ctx, lcd_ink());
@@ -1633,30 +2001,36 @@ static void detail_content_update_proc(Layer *layer, GContext *ctx) {
 
   SessionItem *item = &s_sessions[s_selected_index];
   if (s_detail_loading) {
-    graphics_context_set_text_color(ctx, lcd_dim());
-    draw_tracked(ctx, "LATEST", font_legend(), GPoint(10, -2), 1);
+    graphics_context_set_text_color(ctx, lcd_ink());
+    graphics_draw_text(ctx, item->title, font_row_title(),
+                       GRect(10, -2, bounds.size.w - 20, 21),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     graphics_context_set_fill_color(ctx, lcd_dim());
-    graphics_fill_rect(ctx, GRect(10, 16, bounds.size.w - 20, 1), 0, GCornerNone);
+    graphics_fill_rect(ctx, GRect(10, 34, bounds.size.w - 20, 1), 0, GCornerNone);
     for (int i = 0; i < 4; i++) {
       int lit = (s_stream_phase / 3) % 5;
       graphics_context_set_fill_color(ctx, i == lit ? lcd_ink() : lcd_dim());
       int w = bounds.size.w - 26 - (i == 3 ? 40 : 0);
-      graphics_fill_rect(ctx, GRect(13, 26 + i * 14, w, 8), 0, GCornerNone);
+      graphics_fill_rect(ctx, GRect(13, 42 + i * 14, w, 8), 0, GCornerNone);
     }
     return;
   }
   const char *summary = item->summary[0] ? item->summary : "No summary yet.";
-  graphics_context_set_text_color(ctx, lcd_dim());
-  draw_tracked(ctx, "LATEST", font_legend(), GPoint(10, -2), 1);
-  int lw = tracked_width(item->detail, fonts_get_system_font(FONT_KEY_GOTHIC_14), 1);
-  draw_caption(ctx, item->detail, GPoint(bounds.size.w - 10 - lw, -1), lcd_dim());
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(10, 16, bounds.size.w - 20, 1), 0, GCornerNone);
   graphics_context_set_text_color(ctx, lcd_ink());
-  graphics_draw_text(ctx, summary, font_body(), GRect(10, 20, bounds.size.w - 20, bounds.size.h - 44),
+  graphics_draw_text(ctx, item->title, font_row_title(),
+                     GRect(10, -2, bounds.size.w - 20, 21),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  draw_caption(ctx, item->detail, GPoint(10, 17), lcd_ink());
+  if (item->agent[0]) {
+    int aw = tracked_width(item->agent, font_row_detail(), 1);
+    draw_caption(ctx, item->agent, GPoint(bounds.size.w - 10 - aw, 17), lcd_ink());
+  }
+  graphics_context_set_fill_color(ctx, lcd_dim());
+  graphics_fill_rect(ctx, GRect(10, 34, bounds.size.w - 20, 1), 0, GCornerNone);
+  graphics_context_set_text_color(ctx, lcd_ink());
+  graphics_draw_text(ctx, summary, font_body(), GRect(10, 38, bounds.size.w - 20, bounds.size.h - 62),
                      GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
-  draw_caption(ctx, s_showing_context ? "BACK SUMMARY" : "SELECT FULL LOG   HOLD SPEAK",
-               GPoint(10, bounds.size.h - 20), lcd_dim());
+  draw_caption(ctx, "SELECT LOG   HOLD SPEAK", GPoint(10, bounds.size.h - 20), lcd_ink());
 }
 
 static void detail_header_update_proc(Layer *layer, GContext *ctx) {
@@ -1678,7 +2052,7 @@ static void detail_header_update_proc(Layer *layer, GContext *ctx) {
   } else {
     snprintf(right, sizeof(right), "%s", state_word(item->state));
   }
-  draw_legend_band(ctx, bounds, item->title, right);
+  draw_legend_band(ctx, bounds, s_showing_context ? "LOG" : "THREAD", right);
   if (s_context_loading || s_sending_message) {
     draw_busy_rail(ctx, bounds, LEGEND_HEIGHT);
   } else {
@@ -1697,7 +2071,6 @@ static void detail_reset_scroll(bool animated) {
 static void detail_exit_context(bool animated) {
   s_showing_context = false;
   s_context_loading = false;
-  s_context_page_nav = false;
   s_context_page = 0;
   s_context_page_count = 1;
   s_full_context[0] = '\0';
@@ -1708,16 +2081,20 @@ static void detail_exit_context(bool animated) {
 
 static void detail_select_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_showing_context) {
-    s_context_page_nav = !s_context_page_nav;
-    update_detail_text();
-  } else {
-    request_detail(s_selected_index, true);
+    /* Already reading: jump to the newest page, which is the one worth
+       reaching quickly in a long log. */
+    if (s_context_page != s_context_page_count - 1) {
+      request_context_page(s_context_page_count - 1);
+    }
+    return;
   }
+  request_detail(s_selected_index, true);
 }
 
+/* Reply stays on a short press because it is the common case; everything else
+   lives behind this menu rather than competing for the four buttons. */
 static void detail_select_long_handler(ClickRecognizerRef recognizer, void *context) {
-  s_dictation_target = DictationTargetSession;
-  start_dictation();
+  open_thread_actions();
 }
 
 static void detail_back_click_handler(ClickRecognizerRef recognizer, void *context) {
@@ -1747,8 +2124,22 @@ static void detail_scroll_by(int delta) {
   scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, -next), true);
 }
 
+static bool detail_at_top(void) {
+  if (!s_scroll_layer) {
+    return true;
+  }
+  return scroll_layer_get_content_offset(s_scroll_layer).y >= 0;
+}
+
+static bool detail_at_bottom(void) {
+  if (!s_scroll_layer) {
+    return true;
+  }
+  return -scroll_layer_get_content_offset(s_scroll_layer).y >= detail_scroll_max_offset();
+}
+
 static void detail_up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (s_showing_context && s_context_page_nav) {
+  if (s_showing_context && detail_at_top() && s_context_page > 0) {
     request_context_page(s_context_page - 1);
     return;
   }
@@ -1756,7 +2147,7 @@ static void detail_up_click_handler(ClickRecognizerRef recognizer, void *context
 }
 
 static void detail_down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (s_showing_context && s_context_page_nav) {
+  if (s_showing_context && detail_at_bottom() && s_context_page < s_context_page_count - 1) {
     request_context_page(s_context_page + 1);
     return;
   }
@@ -1775,6 +2166,10 @@ static void dictation_callback(DictationSession *session, DictationSessionStatus
   if (status == DictationSessionStatusSuccess && transcription && transcription[0]) {
     if (s_dictation_target == DictationTargetProject) {
       send_new_thread_text(transcription);
+    } else if (s_dictation_target == DictationTargetNewProject) {
+      send_project_name(transcription);
+    } else if (s_dictation_target == DictationTargetConcierge) {
+      send_concierge_text(transcription);
     } else {
       send_prompt_text(transcription);
     }
@@ -1868,6 +2263,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       copy_tuple(item->summary, sizeof(item->summary), iter, KEY_SUMMARY);
       copy_tuple(item->request_id, sizeof(item->request_id), iter, KEY_REQUEST_ID);
       copy_tuple(item->request_kind, sizeof(item->request_kind), iter, KEY_REQUEST_KIND);
+      item->settled = int_tuple(iter, KEY_SETTLED, 0) != 0;
       if (index + 1 > s_session_count) {
         s_session_count = index + 1;
       }
@@ -1877,8 +2273,13 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     if (total == 0) {
       reset_sessions();
     }
+    s_scope = int_tuple(iter, KEY_SCOPE, s_scope);
+    s_offset = int_tuple(iter, KEY_OFFSET, s_offset);
+    s_matched = int_tuple(iter, KEY_MATCHED, s_session_count);
+    s_other = int_tuple(iter, KEY_OTHER, 0);
     s_loading_threads = false;
     s_threads_synced = true;
+    rebuild_footers();
     mark_all_dirty();
     update_stream_timer();
   } else if (command == CMD_PROJECT_ITEM) {
@@ -1946,6 +2347,15 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     update_detail_text();
     update_stream_timer();
     schedule_refresh(2500);
+  } else if (command == CMD_PROJECT_PREVIEW) {
+    /* The phone resolved a dictated name to a path. Show it and wait: nothing
+       is created until the confirm menu is answered. */
+    copy_tuple(s_pending_project_path, sizeof(s_pending_project_path), iter, KEY_PATH);
+    copy_tuple(s_pending_project_name, sizeof(s_pending_project_name), iter, KEY_NAME);
+    if (s_pending_project_path[0]) {
+      set_status(s_pending_project_path);
+      open_project_confirm();
+    }
   } else if (command == CMD_STATUS) {
     char status[40] = "";
     copy_tuple(status, sizeof(status), iter, KEY_STATUS);
@@ -2030,7 +2440,8 @@ static void thread_window_load(Window *window) {
     .get_cell_height = thread_cell_height,
     .draw_header = thread_draw_header,
     .draw_row = thread_draw_row,
-    .select_click = thread_select
+    .select_click = thread_select,
+    .select_long_click = thread_select_long
   });
   menu_layer_set_click_config_onto_window(s_thread_menu, window);
   layer_add_child(window_layer, menu_layer_get_layer(s_thread_menu));
@@ -2100,10 +2511,10 @@ static void detail_window_unload(Window *window) {
 }
 
 static void init(void) {
-  s_font_dseg_big = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_34));
-  s_font_dseg_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_16));
-  s_font_tech = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_TECH_18));
-  s_font_tech_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_TECH_14));
+  s_font_dseg_big = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_42));
+  s_font_dseg_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_20));
+  s_font_tech = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_TECH_20));
+  s_font_tech_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_TECH_16));
   lcd_tiles_create();
 
   reset_hosts();

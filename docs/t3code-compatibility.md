@@ -44,11 +44,21 @@ The thread detail response is `{ snapshotSequence, thread, page }`.
 
 `POST /api/orchestration/dispatch`, carrying a `ClientOrchestrationCommand`:
 
+- `project.create`
 - `thread.create`
 - `thread.turn.start`
 - `thread.turn.interrupt`
+- `thread.settle` / `thread.unsettle`
 - `thread.approval.respond`
 - `thread.user-input.respond`
+
+`thread.unsettle` requires `reason: "user"`. Settling sets `settledAt` and
+`settledOverride: "settled"`; unsettling clears `settledAt` and sets
+`settledOverride: "active"`.
+
+`project.create` honours `createWorkspaceRootIfMissing`, and the REST
+normalizer resolves `workspaceRoot` before dispatch, so the watch can create a
+project and its directory without an agent involved.
 
 A malformed command is rejected with `400 invalid_request`.
 

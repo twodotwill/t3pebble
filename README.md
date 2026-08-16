@@ -22,6 +22,43 @@ It uses:
 
 See [docs/t3code-compatibility.md](docs/t3code-compatibility.md) for the exact API surface this depends on.
 
+## Working With Threads
+
+The watch opens a host on its **active** threads — anything still running,
+waiting, or erroring. Finished work is one row away:
+
+- The last row of the list switches scope: `SETTLED 34` opens the settled list,
+  `ACTIVE 6` comes back. Settled covers snoozed threads too.
+- Settled history arrives a page at a time; a `MORE 20 OF 34` row fetches the
+  next page.
+- Ordering is by activity, so a thread that aged out sits where its work left
+  it rather than where the server noticed.
+
+Holding **Select** on a thread opens its actions. The menu is built per thread,
+so an active one offers Settle and Interrupt while a settled one offers
+Unsettle. A short press still replies by dictation, which is the common case.
+
+Threads settle themselves after three days of quiet, matching T3 Code's own
+sidebar, so most of the settled list is work nobody explicitly closed.
+
+## Creating A Project From The Watch
+
+Set a **Project root** for a host in settings, then pick `New project` under the
+project list and dictate a name. The phone resolves it to an absolute path and
+shows it; nothing is created until you confirm:
+
+```text
+"sparkle renderer"  ->  /home/will/Projects/sparkle-renderer
+```
+
+Confirming dispatches `project.create` with `createWorkspaceRootIfMissing`, so
+the directory is made for you.
+
+Holding **Select** on that same row instead describes the location out loud. A
+**concierge project**, named in settings, has its agent work out the path and
+propose it. The agent only proposes — the watch still creates it after you
+approve, so the confirmation stays a real gate.
+
 ## What Works
 
 - Lists recent active T3 Code threads on the watch.
@@ -103,6 +140,8 @@ Useful environment variables:
 - `T3PEBBLE_SERVE_PORT` — HTTPS port for that mode, defaults to `443`.
 - `T3PEBBLE_LABEL` — watch label for this machine; defaults to its short
   tailnet name. The watch shows 18 characters.
+- `T3PEBBLE_PROJECT_ROOT` — where projects dictated from the watch are created
+  on this machine. Adds it to the paste line so it arrives with the token.
 
 #### Tailscale Serve mode (optional)
 

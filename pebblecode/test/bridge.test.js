@@ -233,7 +233,10 @@ async function main() {
   storedSettings = JSON.stringify({ baseUrl: "http://old-host:4096", token: "keep-me" })
   context.localStorage.setItem("t3pebble_build_label", "v0.2.0")
   assertJsonEqual(context.settings(), {
-    servers: [{ id: "s1", label: "old-host:4096", baseUrl: "http://old-host:4096", token: "keep-me" }],
+    servers: [{
+      id: "s1", label: "old-host:4096", baseUrl: "http://old-host:4096", token: "keep-me",
+      projectRoot: "", concierge: "",
+    }],
     nextServerId: 2,
   })
 
@@ -406,10 +409,22 @@ async function main() {
   sentMessages = []
   requests = []
   context.shellByServer = {}
+  // This host's only thread is settled, so the default scope is empty and the
+  // end message points at where the work went.
   context.selectHost("s2")
+  await waitFor(() => sentMessages.find((m) => m.cmd === CMD.projectEnd), "projectEnd-active")
+  assert.strictEqual(sentMessages.filter((m) => m.cmd === CMD.sessionItem).length, 0)
+  const emptyEnd = sentMessages.filter((m) => m.cmd === CMD.sessionEnd).pop()
+  assert.strictEqual(emptyEnd.scope, 0)
+  assert.strictEqual(emptyEnd.other, 1)
+
+  sentMessages = []
+  context.shellByServer = {}
+  context.selectHost("s2", 1)
   await waitFor(() => sentMessages.find((m) => m.cmd === CMD.projectEnd), "projectEnd-1")
   const threadRows = sentMessages.filter((m) => m.cmd === CMD.sessionItem)
   assert.strictEqual(threadRows.length, 1)
+  assert.strictEqual(threadRows[0].settled, 1)
   assert.strictEqual(threadRows[0].session_id, "s2::t_settled")
   assert.strictEqual(threadRows[0].title, "Old work")
   assert.strictEqual(threadRows[0].state, "settled")
@@ -454,7 +469,9 @@ async function main() {
   })
   sentMessages = []
   context.shellByServer = {}
-  context.selectHost("s2")
+  // Aged out past the auto-settle window, so it rests in the settled scope
+  // even though nobody settled it explicitly.
+  context.selectHost("s2", 1)
   await waitFor(() => sentMessages.find((m) => m.cmd === CMD.projectEnd), "projectEnd-aged")
   const agedRow = sentMessages.filter((m) => m.cmd === CMD.sessionItem)[0]
   assert.strictEqual(agedRow.state, "settled")
@@ -549,7 +566,14 @@ async function main() {
     label: "beta1",
     baseUrl: "https://beta1.tail253492.ts.net",
     token: "tok_one",
+    projectRoot: "",
   })
+  // Field four is optional, so it can carry the project root without breaking
+  // lines written before it existed.
+  const withRoot = context.parseServerBundle(
+    "t3pebble1|beta1|https://beta1.ts.net|tok|/home/will/Projects/"
+  )
+  assert.strictEqual(withRoot[0].projectRoot, "/home/will/Projects")
   // A trailing slash would otherwise produce a double slash in every path.
   assert.strictEqual(bundle[1].baseUrl, "https://mini.tail253492.ts.net")
   assert.strictEqual(bundle[1].label, "mini")
@@ -633,6 +657,22 @@ async function main() {
   assert.strictEqual(round.servers.length, 2)
   assert.strictEqual(round.servers[0].label, "beta1")
   assert.strictEqual(round.servers[1].token, "tok_rotated")
+
+  // --- dictated project names resolve to a path -------------------------
+
+  assert.strictEqual(context.projectSlug("Sparkle Renderer"), "sparkle-renderer")
+  assert.strictEqual(context.projectSlug("  the user's  API!!  "), "the-users-api")
+  assert.strictEqual(context.projectSlug("!!!"), "")
+  // Dictation can run long; a directory name should not.
+  assert.ok(context.projectSlug("a".repeat(90)).length <= 48)
+
+  assert.strictEqual(
+    context.projectPathFor({ projectRoot: "/home/will/Projects" }, "Sparkle Renderer"),
+    "/home/will/Projects/sparkle-renderer"
+  )
+  // No root configured means the flow is off, not that it guesses a location.
+  assert.strictEqual(context.projectPathFor({ projectRoot: "" }, "anything"), "")
+  assert.strictEqual(context.projectPathFor({ projectRoot: "/tmp" }, "!!!"), "")
 
   console.log("phone bridge tests passed")
 }

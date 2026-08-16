@@ -100,7 +100,7 @@ T3 URL:       $BASE_URL
 
 Paste this line into the Pebble app settings, under Quick setup:
 
-$(t3_bundle_line "$WATCH_LABEL" "$BASE_URL" "$TOKEN")
+$(t3_bundle_line "$WATCH_LABEL" "$BASE_URL" "$TOKEN" "${T3PEBBLE_PROJECT_ROOT:-}")
 
 Run this on each machine and paste every line to attach several hosts.
 
