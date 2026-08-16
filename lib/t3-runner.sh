@@ -107,6 +107,17 @@ t3_tailscale_https_base_url() {
   fi
 }
 
+# Returns success when a T3 Code backend is already serving at this base URL.
+# The environment endpoint is public by design and identifies T3 without
+# needing to mint or expose a token just for the readiness probe.
+t3_server_is_ready() {
+  local base_url="$1" environment
+  command -v curl >/dev/null 2>&1 || return 1
+  environment="$(curl --max-time 2 -fsS \
+    "${base_url%/}/.well-known/t3/environment" 2>/dev/null)" || return 1
+  [[ "$environment" == *'"serverVersion"'* ]]
+}
+
 # Short name the watch shows for this machine when no label is set explicitly.
 # Prefers the MagicDNS leading segment, falls back to the system hostname.
 t3_default_label() {

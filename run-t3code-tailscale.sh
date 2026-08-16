@@ -40,11 +40,6 @@ SERVE_PORT="${T3PEBBLE_SERVE_PORT:-443}"
 
 t3_resolve || exit 1
 
-BASE_DIR_ARGS=()
-if [[ -n "${T3CODE_BASE_DIR:-}" ]]; then
-  BASE_DIR_ARGS=(--base-dir "$T3CODE_BASE_DIR")
-fi
-
 if [[ "$TAILSCALE_SERVE" == "1" ]]; then
   # Serve proxies the tailnet to loopback, so the server itself never needs a
   # routable bind address.
@@ -70,16 +65,24 @@ else
   BASE_URL="http://$HOST:$PORT"
 fi
 
+LOCAL_BASE_URL="http://$HOST:$PORT"
+REUSE_RUNNING_SERVER=0
+if [[ "$TAILSCALE_SERVE" == "1" ]] && t3_server_is_ready "$LOCAL_BASE_URL"; then
+  REUSE_RUNNING_SERVER=1
+  echo "Using the existing T3 Code server at $LOCAL_BASE_URL." >&2
+fi
+
 # Reuse a token across restarts when one is supplied; otherwise mint a fresh
 # bearer access token against the same data directory the server will use.
 if [[ -n "${T3PEBBLE_TOKEN:-}" ]]; then
   TOKEN="$T3PEBBLE_TOKEN"
 else
-  TOKEN="$("${T3[@]}" auth session issue \
-    "${BASE_DIR_ARGS[@]}" \
-    --ttl "$TOKEN_TTL" \
-    --label "$TOKEN_LABEL" \
-    --token-only)"
+  AUTH_ARGS=(auth session issue)
+  if [[ -n "${T3CODE_BASE_DIR:-}" ]]; then
+    AUTH_ARGS+=(--base-dir "$T3CODE_BASE_DIR")
+  fi
+  AUTH_ARGS+=(--ttl "$TOKEN_TTL" --label "$TOKEN_LABEL" --token-only)
+  TOKEN="$("${T3[@]}" "${AUTH_ARGS[@]}")"
   TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
 fi
 
@@ -127,13 +130,24 @@ Tailscale Serve maps $BASE_URL to http://$HOST:$PORT and persists across
 restarts. Remove it with: tailscale serve --https=$SERVE_PORT off
 
 The first request can lag while Tailscale provisions a certificate.
-To keep the server itself running after a reboot: ${T3[*]} service install
 EOF
 fi
 
-exec "${T3[@]}" serve \
-  --host "$HOST" \
-  --port "$PORT" \
-  --no-browser \
-  "${BASE_DIR_ARGS[@]}" \
-  "$@"
+if [[ "$REUSE_RUNNING_SERVER" == "1" ]]; then
+  cat <<EOF
+The existing T3 Code desktop server is being reused. Keep the desktop app open
+while the watch is connected; no second server was started.
+EOF
+  exit 0
+fi
+
+if [[ "$TAILSCALE_SERVE" == "1" ]]; then
+  echo "To keep the server itself running after a reboot: ${T3[*]} service install"
+fi
+
+SERVE_ARGS=(serve --host "$HOST" --port "$PORT" --no-browser)
+if [[ -n "${T3CODE_BASE_DIR:-}" ]]; then
+  SERVE_ARGS+=(--base-dir "$T3CODE_BASE_DIR")
+fi
+
+exec "${T3[@]}" "${SERVE_ARGS[@]}" "$@"
