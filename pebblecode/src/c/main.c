@@ -113,6 +113,8 @@ typedef enum {
 static Window *s_host_window;
 static Window *s_thread_window;
 static Window *s_detail_window;
+static Window *s_diag_window;
+static Layer *s_diag_layer;
 static MenuLayer *s_thread_menu;
 static Layer *s_host_layer;
 static Layer *s_thread_chrome;
@@ -151,6 +153,16 @@ static bool s_context_page_nav;
 static bool s_sending_message;
 static bool s_link_down;
 static time_t s_last_sync;
+static bool s_detail_loading;
+
+/* Errors are kept, not flashed. The reference prints MONITOR in red beneath
+   the glass; that is where a fault belongs, and the log behind it is what
+   makes a failure debuggable from the wrist. */
+#define ERROR_LOG_DEPTH 6
+static char s_error_log[ERROR_LOG_DEPTH][64];
+static int s_error_log_count;
+static int s_error_total;
+static bool s_error_active;
 
 static char s_status_text[40];
 static char s_full_context[MAX_CONTEXT_TEXT];
@@ -158,6 +170,7 @@ static char s_pending_context_session_id[80];
 static char s_pending_context_request_id[16];
 static char s_draw_body[MAX_CONTEXT_TEXT];
 
+static void log_error(const char *text);
 static void request_refresh(void);
 static void request_detail(int index, bool full_context);
 static void request_context_page(int page);
@@ -171,6 +184,28 @@ static void detail_content_update_proc(Layer *layer, GContext *ctx);
 static void update_detail_text(void);
 static void detail_reset_scroll(bool animated);
 static void open_selected_host(void);
+
+static void log_error(const char *text) {
+  if (!text || !text[0]) {
+    return;
+  }
+  if (s_error_log_count > 0 && strncmp(s_error_log[0], text, sizeof(s_error_log[0]) - 1) == 0) {
+    /* A repeating fault should not push the earlier context out of the log. */
+    s_error_active = true;
+    return;
+  }
+  for (int i = ERROR_LOG_DEPTH - 1; i > 0; i--) {
+    strncpy(s_error_log[i], s_error_log[i - 1], sizeof(s_error_log[i]) - 1);
+    s_error_log[i][sizeof(s_error_log[i]) - 1] = '\0';
+  }
+  strncpy(s_error_log[0], text, sizeof(s_error_log[0]) - 1);
+  s_error_log[0][sizeof(s_error_log[0]) - 1] = '\0';
+  if (s_error_log_count < ERROR_LOG_DEPTH) {
+    s_error_log_count++;
+  }
+  s_error_total++;
+  s_error_active = true;
+}
 
 /* ---------------------------------------------------------------- palette */
 
@@ -332,7 +367,7 @@ static bool any_live_row(void) {
 
 static bool animation_active(void) {
   return s_loading_hosts || s_loading_threads || s_context_loading || s_sending_message ||
-         !s_hosts_synced || any_live_row();
+         s_detail_loading || !s_hosts_synced || any_live_row();
 }
 
 static void stream_timer_callback(void *context) {
@@ -349,6 +384,9 @@ static void stream_timer_callback(void *context) {
     if (s_thread_menu) {
       layer_mark_dirty(menu_layer_get_layer(s_thread_menu));
     }
+  }
+  if (s_diag_layer && window_stack_get_top_window() == s_diag_window) {
+    layer_mark_dirty(s_diag_layer);
   }
   if (detail_window_visible()) {
     if (s_detail_header_layer) {
@@ -598,9 +636,47 @@ static void draw_legend_band(GContext *ctx, GRect bounds, const char *left, cons
   if (left && left[0]) {
     draw_tracked(ctx, left, font_legend(), GPoint(6, -3), 1);
   }
+  /* A fault count rides the top band in crimson so it is visible from every
+     screen without covering anything. */
+  char tail[24];
+  if (s_error_total > 0) {
+    snprintf(tail, sizeof(tail), "ERR%d", s_error_total);
+    int ew = tracked_width(tail, font_legend(), 1);
+    graphics_context_set_text_color(ctx, rule_color());
+    draw_tracked(ctx, tail, font_legend(), GPoint(bounds.size.w - 6 - ew, -3), 1);
+    if (right && right[0]) {
+      int w = tracked_width(right, font_legend(), 1);
+      graphics_context_set_text_color(ctx, legend());
+      draw_tracked(ctx, right, font_legend(), GPoint(bounds.size.w - 12 - ew - w, -3), 1);
+    }
+    return;
+  }
   if (right && right[0]) {
     int w = tracked_width(right, font_legend(), 1);
     draw_tracked(ctx, right, font_legend(), GPoint(bounds.size.w - 6 - w, -3), 1);
+  }
+}
+
+/* The bottom band: normally a legend, but a live fault takes it over in
+   crimson the way MONITOR does on the reference. */
+static void draw_bottom_band(GContext *ctx, GRect bounds, const char *left, const char *right) {
+  int y = bounds.size.h - BOTTOM_CHROME + 1;
+  if (s_error_active && s_error_log_count > 0) {
+    graphics_context_set_text_color(ctx, rule_color());
+    draw_tracked(ctx, "ERR", font_legend(), GPoint(6, y), 1);
+    graphics_context_set_text_color(ctx, legend());
+    graphics_draw_text(ctx, s_error_log[0], fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(30, y - 2, bounds.size.w - 36, 16),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    return;
+  }
+  graphics_context_set_text_color(ctx, legend());
+  if (left && left[0]) {
+    draw_tracked(ctx, left, font_legend(), GPoint(6, y), 1);
+  }
+  if (right && right[0]) {
+    int w = tracked_width(right, font_legend(), 1);
+    draw_tracked(ctx, right, font_legend(), GPoint(bounds.size.w - 6 - w, y), 1);
   }
 }
 
@@ -795,10 +871,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
       draw_self_test(ctx, panel, "NO HOSTS",
                      s_status_text[0] ? s_status_text : "Add a server in app settings");
     }
-    graphics_context_set_text_color(ctx, legend());
-    draw_tracked(ctx, "SELECT TO RETRY", font_legend(),
-                 GPoint(bounds.size.w - 6 - tracked_width("SELECT TO RETRY", font_legend(), 1),
-                        bounds.size.h - BOTTOM_CHROME + 1), 1);
+    draw_bottom_band(ctx, bounds, "DIAG HOLD", "RETRY");
     return;
   }
 
@@ -844,9 +917,16 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   int label_x = inner_x + big_w * 2 + 14;
   graphics_context_set_text_color(ctx, lcd_ink());
   draw_tracked(ctx, state_word(host->state), font_legend(), GPoint(label_x, big_y + 2), 1);
-  char of_line[24];
-  snprintf(of_line, sizeof(of_line), "OF %d", total);
-  draw_caption(ctx, of_line, GPoint(label_x, big_y + 17), lcd_dim());
+  if (state_is(host->state, "offline")) {
+    graphics_draw_text(ctx, s_error_log_count > 0 ? s_error_log[0] : "no answer",
+                       fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(label_x, big_y + 14, panel.size.w - (label_x - panel.origin.x) - 8, 30),
+                       GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
+  } else {
+    char of_line[24];
+    snprintf(of_line, sizeof(of_line), "OF %d", total);
+    draw_caption(ctx, of_line, GPoint(label_x, big_y + 17), lcd_dim());
+  }
   draw_caption(ctx, state_is(host->state, "offline") ? "TAP RETRY" : "TAP OPEN",
                GPoint(label_x, big_y + 30), lcd_dim());
 
@@ -872,11 +952,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   draw_host_strip(ctx, GPoint(panel.origin.x + panel.size.w - 8 - s_host_count * 8, strip_y + 1),
                   s_host_count, s_host_cursor);
 
-  graphics_context_set_text_color(ctx, legend());
-  draw_tracked(ctx, "HOST", font_legend(), GPoint(6, bounds.size.h - BOTTOM_CHROME + 1), 1);
-  const char *hint = "OPEN";
-  int hw = tracked_width(hint, font_legend(), 1);
-  draw_tracked(ctx, hint, font_legend(), GPoint(bounds.size.w - 6 - hw, bounds.size.h - BOTTOM_CHROME + 1), 1);
+  draw_bottom_band(ctx, bounds, "HOST", "OPEN");
 }
 
 static void host_step(int delta) {
@@ -903,10 +979,17 @@ static void host_select_click(ClickRecognizerRef recognizer, void *context) {
   open_selected_host();
 }
 
+static void host_select_long(ClickRecognizerRef recognizer, void *context) {
+  if (s_diag_window) {
+    window_stack_push(s_diag_window, true);
+  }
+}
+
 static void host_click_config(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, host_up_click);
   window_single_click_subscribe(BUTTON_ID_DOWN, host_down_click);
   window_single_click_subscribe(BUTTON_ID_SELECT, host_select_click);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 0, host_select_long, NULL);
 }
 
 static void open_selected_host(void) {
@@ -927,6 +1010,76 @@ static void open_selected_host(void) {
   dict_write_int(iter, KEY_CMD, &command, sizeof(command), true);
   dict_write_cstring(iter, KEY_HOST_ID, s_hosts[s_selected_host_index].id);
   app_message_outbox_send();
+}
+
+/* ------------------------------------------------------------ diagnostics */
+
+/* Held behind the host screen: what the app knows about itself, and the fault
+   log in full. Rendered on the same glass as everything else so debugging
+   never drops out of the theme. */
+static void diag_layer_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  GRect panel = draw_panel(ctx, bounds);
+
+  char count[16];
+  snprintf(count, sizeof(count), "%d", s_error_total);
+  draw_legend_band(ctx, bounds, "DIAG", s_error_total > 0 ? "" : count);
+  draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
+  draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME, false);
+
+  int x = panel.origin.x + 7;
+  int w = panel.size.w - 14;
+  int y = panel.origin.y + 2;
+
+  char age[12];
+  sync_age_text(age, sizeof(age));
+  char line[64];
+
+  snprintf(line, sizeof(line), "%s   LINK %s", BUILD_LABEL, s_link_down ? "DOWN" : "OK");
+  graphics_context_set_text_color(ctx, lcd_ink());
+  draw_tracked(ctx, line, font_legend(), GPoint(x, y), 1);
+  y += 15;
+
+  snprintf(line, sizeof(line), "HOSTS %d   THR %d   SYN %s", s_host_count, s_session_count, age);
+  draw_caption(ctx, line, GPoint(x, y), lcd_dim());
+  y += 14;
+
+  graphics_context_set_fill_color(ctx, lcd_dim());
+  graphics_fill_rect(ctx, GRect(x, y, w, 1), 0, GCornerNone);
+  y += 4;
+
+  if (s_error_log_count == 0) {
+    draw_caption(ctx, "NO FAULTS LOGGED", GPoint(x, y + 4), lcd_dim());
+  } else {
+    for (int i = 0; i < s_error_log_count && y < panel.origin.y + panel.size.h - 16; i++) {
+      char idx[6];
+      snprintf(idx, sizeof(idx), "%d", s_error_total - i);
+      graphics_context_set_text_color(ctx, rule_color());
+      draw_tracked(ctx, idx, font_legend(), GPoint(x, y - 2), 1);
+      graphics_context_set_text_color(ctx, lcd_ink());
+      graphics_draw_text(ctx, s_error_log[i], fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                         GRect(x + 16, y - 3, w - 16, 30),
+                         GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+      y += 16;
+    }
+  }
+
+  draw_bottom_band(ctx, bounds, "FAULTS", "BACK");
+}
+
+static void diag_window_load(Window *window) {
+  Layer *window_layer = window_get_root_layer(window);
+  window_set_background_color(window, chassis());
+  s_diag_layer = layer_create(layer_get_bounds(window_layer));
+  layer_set_update_proc(s_diag_layer, diag_layer_update_proc);
+  layer_add_child(window_layer, s_diag_layer);
+}
+
+static void diag_window_unload(Window *window) {
+  if (s_diag_layer) {
+    layer_destroy(s_diag_layer);
+  }
+  s_diag_layer = NULL;
 }
 
 /* ---------------------------------------------------------- thread screen */
@@ -1007,10 +1160,11 @@ static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
   }
   char tally[24];
   snprintf(tally, sizeof(tally), "N%d R%d S%d", needs, running, settled);
-  graphics_context_set_text_color(ctx, legend());
-  draw_tracked(ctx, tally, font_legend(), GPoint(6, bounds.size.h - BOTTOM_CHROME + 1), 1);
-  draw_host_strip(ctx, GPoint(bounds.size.w - 8 - s_host_count * 8, bounds.size.h - BOTTOM_CHROME + 5),
-                  s_host_count, s_selected_host_index);
+  draw_bottom_band(ctx, bounds, tally, "");
+  if (!s_error_active) {
+    draw_host_strip(ctx, GPoint(bounds.size.w - 8 - s_host_count * 8, bounds.size.h - BOTTOM_CHROME + 5),
+                    s_host_count, s_selected_host_index);
+  }
 }
 
 static uint16_t thread_num_sections(MenuLayer *menu_layer, void *data) {
@@ -1045,7 +1199,16 @@ static void thread_draw_header(GContext *ctx, const Layer *cell_layer, uint16_t 
   draw_tracked(ctx, "START NEW", font_legend(), GPoint(6, -4), 1);
 }
 
+static bool thread_list_is_empty(void) {
+  return s_threads_synced && !s_loading_threads && s_session_count == 0 && s_project_count == 0;
+}
+
 static int16_t thread_cell_height(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
+  if (thread_list_is_empty() && cell_index->section == 0) {
+    /* One full-height cell so the glass shows a panel rather than a stray row
+       floating in empty space. */
+    return s_thread_menu ? layer_get_bounds(menu_layer_get_layer(s_thread_menu)).size.h : ROW_HEIGHT;
+  }
   return ROW_HEIGHT;
 }
 
@@ -1066,7 +1229,14 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
     return;
   }
   if (s_session_count == 0) {
-    draw_list_row(ctx, cell_layer, selected, "No threads", "nothing open here", "empty");
+    GRect bounds = layer_get_bounds(cell_layer);
+    graphics_context_set_fill_color(ctx, lcd_glass());
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+    if (thread_list_is_empty()) {
+      draw_self_test(ctx, bounds, "NO THREADS", "Nothing open on this machine");
+    } else {
+      draw_list_row(ctx, cell_layer, selected, "No threads", "start one below", "empty");
+    }
     return;
   }
   if (cell_index->row >= s_session_count) {
@@ -1107,6 +1277,7 @@ static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *da
 
 static void send_command_begin(DictionaryIterator **iter, int command) {
   if (app_message_outbox_begin(iter) != APP_MSG_OK || !*iter) {
+    log_error("Phone link busy");
     set_status("Phone link busy");
     return;
   }
@@ -1140,12 +1311,14 @@ static void request_detail(int index, bool full_context) {
   s_showing_context = false;
   s_context_loading = false;
   s_context_page_nav = false;
+  s_detail_loading = true;
   s_pending_context_session_id[0] = '\0';
   s_pending_context_request_id[0] = '\0';
   s_context_page = 0;
   s_context_page_count = 1;
   s_full_context[0] = '\0';
   update_detail_text();
+  update_stream_timer();
 
   DictionaryIterator *iter = NULL;
   send_command_begin(&iter, CMD_DETAIL);
@@ -1408,6 +1581,19 @@ static void detail_content_update_proc(Layer *layer, GContext *ctx) {
   }
 
   SessionItem *item = &s_sessions[s_selected_index];
+  if (s_detail_loading) {
+    graphics_context_set_text_color(ctx, lcd_dim());
+    draw_tracked(ctx, "LATEST", font_legend(), GPoint(10, -2), 1);
+    graphics_context_set_fill_color(ctx, lcd_dim());
+    graphics_fill_rect(ctx, GRect(10, 16, bounds.size.w - 20, 1), 0, GCornerNone);
+    for (int i = 0; i < 4; i++) {
+      int lit = (s_stream_phase / 3) % 5;
+      graphics_context_set_fill_color(ctx, i == lit ? lcd_ink() : lcd_dim());
+      int w = bounds.size.w - 26 - (i == 3 ? 40 : 0);
+      graphics_fill_rect(ctx, GRect(13, 26 + i * 14, w, 8), 0, GCornerNone);
+    }
+    return;
+  }
   const char *summary = item->summary[0] ? item->summary : "No summary yet.";
   graphics_context_set_text_color(ctx, lcd_dim());
   draw_tracked(ctx, "LATEST", font_legend(), GPoint(10, -2), 1);
@@ -1542,6 +1728,7 @@ static void dictation_callback(DictationSession *session, DictationSessionStatus
       send_prompt_text(transcription);
     }
   } else {
+    log_error("Dictation failed");
     set_status("Dictation failed");
   }
 }
@@ -1609,6 +1796,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     s_loading_hosts = false;
     s_hosts_synced = true;
     s_link_down = false;
+    s_error_active = false;
     s_last_sync = time(NULL);
     s_host_cursor = clamp_int(s_host_cursor, 0, s_host_count > 0 ? s_host_count - 1 : 0);
     mark_all_dirty();
@@ -1675,6 +1863,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
         s_session_count = index + 1;
       }
     }
+    s_detail_loading = false;
     update_detail_text();
     mark_all_dirty();
     update_stream_timer();
@@ -1718,6 +1907,8 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     s_context_loading = false;
     s_hosts_synced = true;
     s_threads_synced = true;
+    s_detail_loading = false;
+    log_error(error[0] ? error : "Error");
     set_status(error[0] ? error : "Error");
     update_detail_text();
     update_stream_timer();
@@ -1725,7 +1916,11 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
 }
 
 static void inbox_dropped_callback(AppMessageResult reason, void *context) {
-  set_status("Dropped a message");
+  char text[48];
+  snprintf(text, sizeof(text), "Dropped a message (%d)", (int)reason);
+  log_error(text);
+  set_status(text);
+  mark_all_dirty();
 }
 
 static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult reason, void *context) {
@@ -1734,7 +1929,13 @@ static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult re
   s_sending_message = false;
   s_hosts_synced = true;
   s_link_down = true;
-  set_status("Phone bridge not responding");
+  s_detail_loading = false;
+  {
+    char text[48];
+    snprintf(text, sizeof(text), "Phone bridge silent (%d)", (int)reason);
+    log_error(text);
+    set_status(text);
+  }
   update_stream_timer();
   mark_all_dirty();
 }
@@ -1870,6 +2071,12 @@ static void init(void) {
     .unload = detail_window_unload
   });
 
+  s_diag_window = window_create();
+  window_set_window_handlers(s_diag_window, (WindowHandlers) {
+    .load = diag_window_load,
+    .unload = diag_window_unload
+  });
+
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_inbox_dropped(inbox_dropped_callback);
   app_message_register_outbox_failed(outbox_failed_callback);
@@ -1898,6 +2105,9 @@ static void deinit(void) {
   }
   if (s_detail_window) {
     window_destroy(s_detail_window);
+  }
+  if (s_diag_window) {
+    window_destroy(s_diag_window);
   }
 }
 
