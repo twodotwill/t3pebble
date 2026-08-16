@@ -165,6 +165,42 @@ reboots, install it as a service with `t3 service install`.
 The Pebble app needs no rebuild for this — the phone bridge already accepts any
 `http://` or `https://` base URL. Only the settings field changes.
 
+#### "tailscale is required" on macOS
+
+Tailscale can be running while its CLI is absent from your shell's `PATH`. The
+script checks with `command -v tailscale` and stops when that finds nothing,
+which is what this message means — not that Tailscale is down.
+
+On macOS the CLI ships inside the app bundle:
+
+```text
+/Applications/Tailscale.app/Contents/MacOS/tailscale
+```
+
+The clean fix is to install the CLI integration, which puts it on `PATH` for
+good. Open Tailscale, go to **Settings → CLI integration → Show me how →
+Install Now**, then check:
+
+```sh
+command -v tailscale
+tailscale status
+```
+
+Rerun the script afterwards.
+
+To run it right now without installing the integration, point `PATH` at the
+bundle for the one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/twodotwill/t3pebble/main/run-t3code-tailscale.sh \
+  | PATH="/Applications/Tailscale.app/Contents/MacOS:$PATH" \
+    TAILSCALE_BE_CLI=1 \
+    T3PEBBLE_TAILSCALE_SERVE=1 bash
+```
+
+Tailscale's [macOS CLI documentation](https://tailscale.com/docs/reference/tailscale-cli?tab=macos)
+covers the bundle location and recommends the CLI integration.
+
 To issue a token by hand instead:
 
 ```sh
