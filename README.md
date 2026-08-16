@@ -157,10 +157,15 @@ publishes it over tailnet HTTPS, printing a base URL like
 - the watch talks HTTPS with a real certificate instead of cleartext HTTP
 - no host binding to get right, and no firewall prompt
 
+If the T3 Code desktop app is already serving on the selected loopback port,
+the script reuses that backend instead of trying to start a second server on
+the same port. Keep the desktop app open while the watch is connected. When no
+T3 backend is running, the script starts the published `t3 serve` CLI as before.
+
 It needs MagicDNS and HTTPS certificates enabled for the tailnet. The mapping is
 created with `tailscale serve --bg`, so it survives reboots; remove it with
-`tailscale serve --https=443 off`. To keep the server itself running across
-reboots, install it as a service with `t3 service install`.
+`tailscale serve --https=443 off`. When the script starts a headless backend,
+you can keep that server running across reboots with `t3 service install`.
 
 The Pebble app needs no rebuild for this — the phone bridge already accepts any
 `http://` or `https://` base URL. Only the settings field changes.
