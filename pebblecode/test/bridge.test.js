@@ -513,9 +513,16 @@ async function main() {
   dispatches = []
   context.shellByServer = {}
   context.promptNewThread("s2::proj_mini", "start something")
-  await waitFor(() => dispatches.length === 1, "dispatch-new")
-  assert.strictEqual(dispatches[0].bootstrap.createThread.projectId, "proj_mini")
+  // Two commands: the REST dispatch route ignores bootstrap.createThread, so
+  // the thread is created explicitly before the turn starts against it.
+  await waitFor(() => dispatches.length === 2, "dispatch-new")
+  assert.strictEqual(dispatches[0].type, "thread.create")
+  assert.strictEqual(dispatches[0].projectId, "proj_mini")
   assertJsonEqual(dispatches[0].modelSelection, { instanceId: "codex", model: "gpt-5.6-sol" })
+  assert.strictEqual(dispatches[1].type, "thread.turn.start")
+  // The turn must land on the thread just created, and carry no bootstrap.
+  assert.strictEqual(dispatches[1].threadId, dispatches[0].threadId)
+  assert.strictEqual(dispatches[1].bootstrap, undefined)
 
   // An id naming a host that is no longer configured cannot be dispatched.
   let unknownError = null

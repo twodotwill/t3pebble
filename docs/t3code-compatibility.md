@@ -44,12 +44,37 @@ The thread detail response is `{ snapshotSequence, thread, page }`.
 
 `POST /api/orchestration/dispatch`, carrying a `ClientOrchestrationCommand`:
 
-- `thread.turn.start` (including the `bootstrap.createThread` form used to start a thread in a project)
+- `thread.create`
+- `thread.turn.start`
 - `thread.turn.interrupt`
 - `thread.approval.respond`
 - `thread.user-input.respond`
 
 A malformed command is rejected with `400 invalid_request`.
+
+#### Starting a thread takes two commands, not one
+
+`thread.turn.start` accepts a `bootstrap.createThread` block that is supposed to
+create the thread and start the first turn together. **Do not use it over REST.**
+The REST handler validates the block and then ignores it: it calls
+`orchestrationEngine.dispatch` directly, bypassing the `dispatchNormalizedCommand`
+router that is the only thing routing a bootstrap command into the branch which
+creates the thread. That router is wired into the WebSocket RPC path alone.
+
+The visible symptom is a `500 orchestration_dispatch_failed`, because the turn
+lands on a thread that does not exist yet:
+
+```json
+{"_tag":"OrchestrationCommandInvariantError","commandType":"thread.turn.start",
+ "detail":"Thread '...' does not exist for command 'thread.turn.start'."}
+```
+
+Note that an invalid field inside the block still returns `400`, so the block
+being accepted proves nothing about it being acted on.
+
+So the bridge dispatches `thread.create` first and then `thread.turn.start`
+against that thread id, carrying no bootstrap. Thread ids do not have to be
+UUIDs; the bridge's own `pebble-thread-...` format is accepted.
 
 ### Error shapes
 

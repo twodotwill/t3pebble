@@ -42,7 +42,32 @@
     "c_settled": 23
   },
   "resources": {
-    "media": []
+    "media": [
+      {
+        "type": "font",
+        "name": "FONT_DSEG_34",
+        "file": "fonts/DSEG7Classic-Bold.ttf",
+        "characterRegex": "[0-9:]"
+      },
+      {
+        "type": "font",
+        "name": "FONT_DSEG_16",
+        "file": "fonts/DSEG7Classic-Bold.ttf",
+        "characterRegex": "[0-9:]"
+      },
+      {
+        "type": "font",
+        "name": "FONT_TECH_18",
+        "file": "fonts/ShareTechMono-Regular.ttf",
+        "characterRegex": "[A-Za-z0-9 \u00b7:/.,%+_-]"
+      },
+      {
+        "type": "font",
+        "name": "FONT_TECH_14",
+        "file": "fonts/ShareTechMono-Regular.ttf",
+        "characterRegex": "[A-Za-z0-9 \u00b7:/.,%+_-]"
+      }
+    ]
   },
   "capabilities": [
     "configurable"

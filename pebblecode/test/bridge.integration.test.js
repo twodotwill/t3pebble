@@ -376,9 +376,15 @@ async function main() {
   bridge.listeners.appmessage({
     payload: { [KEY.cmd]: CMD.newThread, [KEY.projectId]: "s1::proj_pebble", [KEY.prompt]: "start fresh" },
   })
-  await waitFor(() => state.dispatches.length === 3, "new thread dispatch")
-  assert.strictEqual(state.dispatches[2].bootstrap.createThread.projectId, "proj_pebble")
+  // The REST dispatch route ignores bootstrap.createThread, so the thread is
+  // created explicitly and the turn then starts against it.
+  await waitFor(() => state.dispatches.length === 4, "new thread dispatch")
+  assert.strictEqual(state.dispatches[2].type, "thread.create")
+  assert.strictEqual(state.dispatches[2].projectId, "proj_pebble")
   assert.strictEqual(state.dispatches[2].modelSelection.model, "gpt-5-codex")
+  assert.strictEqual(state.dispatches[3].type, "thread.turn.start")
+  assert.strictEqual(state.dispatches[3].threadId, state.dispatches[2].threadId)
+  assert.strictEqual(state.dispatches[3].modelSelection.model, "gpt-5-codex")
 
   assert.deepStrictEqual(
     bridge.sentMessages.filter((m) => m.cmd === CMD.error).map((m) => m.error),

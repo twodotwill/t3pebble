@@ -69,19 +69,10 @@
 #define STREAM_TICK_MS 110
 #define GHOST_ROWS 4
 
-/* Seven-segment bit order: a b c d e f g. */
-#define SEG_A 0x01
-#define SEG_B 0x02
-#define SEG_C 0x04
-#define SEG_D 0x08
-#define SEG_E 0x10
-#define SEG_F 0x20
-#define SEG_G 0x40
-#define SEG_ALL 0x7F
-
 typedef struct {
   char id[40];
   char title[40];
+  char detail[40];
   char state[10];
   int needs;
   int run;
@@ -124,6 +115,14 @@ static ScrollLayer *s_scroll_layer;
 static AppTimer *s_refresh_timer;
 static AppTimer *s_stream_timer;
 static DictationSession *s_dictation;
+static GFont s_font_dseg_big;
+static GFont s_font_dseg_small;
+static GFont s_font_tech;
+static GFont s_font_tech_small;
+static GBitmap *s_hatch;
+static GBitmap *s_stipple;
+static GColor s_hatch_palette[2];
+static GColor s_stipple_palette[2];
 static DictationTarget s_dictation_target = DictationTargetSession;
 
 static HostItem s_hosts[MAX_HOSTS];
@@ -212,7 +211,19 @@ static void log_error(const char *text) {
 /* A negative-LCD Casio: near-black chassis, pale glass, dark ink, cyan
    legends, crimson rails. Monochrome watches collapse to black on white,
    which the shape language survives. */
+/* A real positive LCD is a warm tan, not neutral grey; pale grey washes out
+   on the physical panel. This is the substrate the reference photographs as. */
 static GColor lcd_glass(void) {
+#ifdef PBL_COLOR
+  return GColorBrass;
+#else
+  return GColorWhite;
+#endif
+}
+
+/* Unlit segments sit between the substrate and the ink, then get knocked back
+   further by the hatch. */
+static GColor lcd_ghost_tone(void) {
 #ifdef PBL_COLOR
   return GColorLightGray;
 #else
@@ -268,16 +279,19 @@ static GColor active_color(void) {
 #endif
 }
 
+/* Share Tech Mono carries every label and title: a fixed-width technical face
+   is what makes the whole app read as an instrument rather than a phone list.
+   Long prose stays on the system font, which is far easier to read at length. */
 static GFont font_row_title(void) {
-  return fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  return s_font_tech ? s_font_tech : fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 }
 
 static GFont font_row_detail(void) {
-  return fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  return s_font_tech_small ? s_font_tech_small : fonts_get_system_font(FONT_KEY_GOTHIC_14);
 }
 
 static GFont font_legend(void) {
-  return fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  return s_font_tech_small ? s_font_tech_small : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
 }
 
 static GFont font_body(void) {
@@ -426,19 +440,66 @@ static void schedule_refresh(uint32_t delay_ms) {
 
 /* -------------------------------------------------- reference primitives */
 
-/* Pebble has 64 colours and nothing between the glass and the ghost tone, so
-   an unlit segment is dithered: a checker of ink over glass reads as the
-   half-tone an LCD actually shows when a segment is off. Flat dark grey looks
-   like a drawn shape; this looks like a segment that simply is not lit. */
-static void fill_ghost(GContext *ctx, GRect r) {
-  graphics_context_set_fill_color(ctx, lcd_glass());
-  graphics_fill_rect(ctx, r, 0, GCornerNone);
-  graphics_context_set_stroke_color(ctx, lcd_dim());
-  for (int y = r.origin.y; y < r.origin.y + r.size.h; y++) {
-    for (int x = r.origin.x + ((y & 1) ? 1 : 0); x < r.origin.x + r.size.w; x += 2) {
-      graphics_draw_pixel(ctx, GPoint(x, y));
+/* Two 1-bit tiles do all the LCD texture work, blitted rather than drawn
+   pixel by pixel: a stipple that gives the substrate its panel grain, and a
+   hatch that knocks unlit segments back so they read as texture instead of
+   competing with the lit ones. Both are built once at launch. */
+#define STIPPLE_SPACING 4
+
+static void lcd_tiles_create(void) {
+  s_hatch_palette[0] = GColorClear;
+  s_hatch_palette[1] = lcd_glass();
+  s_hatch = gbitmap_create_blank_with_palette(GSize(8, 8), GBitmapFormat1BitPalette,
+                                              s_hatch_palette, false);
+  if (s_hatch) {
+    uint8_t *data = gbitmap_get_data(s_hatch);
+    uint16_t stride = gbitmap_get_bytes_per_row(s_hatch);
+    for (int y = 0; y < 8; y++) {
+      /* 75% coverage: one ghost pixel in four survives. */
+      data[y * stride] = (y % 2 == 0) ? 0xAA : 0xFF;
     }
   }
+
+  s_stipple_palette[0] = GColorClear;
+  s_stipple_palette[1] = lcd_dim();
+  s_stipple = gbitmap_create_blank_with_palette(GSize(8, 8), GBitmapFormat1BitPalette,
+                                                s_stipple_palette, false);
+  if (s_stipple) {
+    uint8_t *data = gbitmap_get_data(s_stipple);
+    uint16_t stride = gbitmap_get_bytes_per_row(s_stipple);
+    for (int y = 0; y < 8; y += STIPPLE_SPACING) {
+      for (int x = 0; x < 8; x += STIPPLE_SPACING) {
+        data[y * stride + x / 8] |= 0x80 >> (x % 8);
+      }
+    }
+  }
+}
+
+static void lcd_tiles_destroy(void) {
+  if (s_hatch) {
+    gbitmap_destroy(s_hatch);
+    s_hatch = NULL;
+  }
+  if (s_stipple) {
+    gbitmap_destroy(s_stipple);
+    s_stipple = NULL;
+  }
+}
+
+static void hatch_rect(GContext *ctx, GRect r) {
+  if (!s_hatch) {
+    return;
+  }
+  graphics_context_set_compositing_mode(ctx, GCompOpSet);
+  graphics_draw_bitmap_in_rect(ctx, s_hatch, r);
+}
+
+static void stipple_rect(GContext *ctx, GRect r) {
+  if (!s_stipple) {
+    return;
+  }
+  graphics_context_set_compositing_mode(ctx, GCompOpSet);
+  graphics_draw_bitmap_in_rect(ctx, s_stipple, r);
 }
 
 /* The glass sits below the chassis face, so it carries a shadow along the top
@@ -505,72 +566,60 @@ static void draw_rail(GContext *ctx, GRect bounds, int y, bool point_up) {
   }
 }
 
-/* Seven-segment digit. Unlit segments stay visible in a darker tone, which is
-   the detail that makes the reference read as an LCD and not a screen. */
-static void draw_seg_digit(GContext *ctx, GRect box, uint8_t mask, GColor on, GColor off) {
-  int t = box.size.w >= 18 ? 3 : 2;
-  int x = box.origin.x, y = box.origin.y, w = box.size.w, h = box.size.h;
-  int half = h / 2;
-  GRect segs[7] = {
-    GRect(x + t, y, w - 2 * t, t),
-    GRect(x + w - t, y + t, t, half - t),
-    GRect(x + w - t, y + half, t, half - t),
-    GRect(x + t, y + h - t, w - 2 * t, t),
-    GRect(x, y + half, t, half - t),
-    GRect(x, y + t, t, half - t),
-    GRect(x + t, y + half - t / 2, w - 2 * t, t),
-  };
-  for (int i = 0; i < 7; i++) {
-    if (mask & (1 << i)) {
-      graphics_context_set_fill_color(ctx, on);
-      graphics_fill_rect(ctx, segs[i], 0, GCornerNone);
-    } else if (gcolor_equal(off, lcd_glass())) {
-      graphics_context_set_fill_color(ctx, off);
-      graphics_fill_rect(ctx, segs[i], 0, GCornerNone);
-    } else {
-      fill_ghost(ctx, segs[i]);
-    }
-  }
+/* Segment digits come from DSEG7, drawn the way a real panel works: the full
+   "88" is laid down in the ghost tone first, the hatch knocks it back, then
+   the live value goes on top. Nothing shifts when a digit is blank, because
+   DSEG is fixed-width and the unlit segments stay put. */
+static GSize seg_text_size(const char *text, GFont font) {
+  return graphics_text_layout_get_content_size(text, font, GRect(0, 0, 160, 80),
+                                               GTextOverflowModeTrailingEllipsis,
+                                               GTextAlignmentLeft);
 }
 
-static uint8_t seg_for_digit(int digit) {
-  static const uint8_t table[10] = {
-    SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,
-    SEG_B | SEG_C,
-    SEG_A | SEG_B | SEG_G | SEG_E | SEG_D,
-    SEG_A | SEG_B | SEG_G | SEG_C | SEG_D,
-    SEG_F | SEG_G | SEG_B | SEG_C,
-    SEG_A | SEG_F | SEG_G | SEG_C | SEG_D,
-    SEG_A | SEG_F | SEG_G | SEG_E | SEG_C | SEG_D,
-    SEG_A | SEG_B | SEG_C,
-    SEG_ALL,
-    SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G,
-  };
-  if (digit < 0 || digit > 9) {
-    return 0;
+static void draw_seg_value(GContext *ctx, GPoint at, int value, int digits, GColor on, bool big) {
+  GFont font = big ? s_font_dseg_big : s_font_dseg_small;
+  if (!font) {
+    /* A resource that failed to load must not leave a hole where the reading
+       goes: fall back to the label face rather than drawing nothing. */
+    char fallback[8];
+    snprintf(fallback, sizeof(fallback), "%d", value);
+    graphics_context_set_text_color(ctx, on);
+    graphics_draw_text(ctx, fallback, big ? font_row_title() : font_row_detail(),
+                       GRect(at.x, at.y, 44, big ? 30 : 18),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    return;
   }
-  return table[digit];
+  char ghost[4] = "88";
+  char live[8];
+  if (digits >= 3) {
+    strncpy(ghost, "888", sizeof(ghost) - 1);
+  } else if (digits == 1) {
+    strncpy(ghost, "8", sizeof(ghost) - 1);
+  }
+  snprintf(live, sizeof(live), "%d", value);
+
+  GSize full = seg_text_size(ghost, font);
+  GSize live_size = seg_text_size(live, font);
+
+  graphics_context_set_text_color(ctx, lcd_ghost_tone());
+  graphics_draw_text(ctx, ghost, font, GRect(at.x, at.y, full.w + 4, full.h + 4),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  hatch_rect(ctx, GRect(at.x, at.y, full.w + 2, full.h + 2));
+
+  /* Right-aligned into the ghost so the ones column never moves. */
+  graphics_context_set_text_color(ctx, on);
+  graphics_draw_text(ctx, live, font,
+                     GRect(at.x + full.w - live_size.w, at.y, live_size.w + 4, full.h + 4),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
-/* Renders a number as segment digits with the unlit segments showing through,
-   exactly like the ghosted 88:88 field on the reference. */
-static void draw_seg_number(GContext *ctx, GRect box, int value, int digits, GColor on) {
-  int gap = box.size.w >= 40 ? 4 : 2;
-  int digit_w = (box.size.w - gap * (digits - 1)) / digits;
-  bool leading = true;
-  for (int i = 0; i < digits; i++) {
-    int place = 1;
-    for (int p = 0; p < digits - 1 - i; p++) {
-      place *= 10;
-    }
-    int digit = (value / place) % 10;
-    if (digit != 0 || i == digits - 1) {
-      leading = false;
-    }
-    uint8_t mask = (leading && digit == 0) ? 0 : seg_for_digit(digit);
-    draw_seg_digit(ctx, GRect(box.origin.x + i * (digit_w + gap), box.origin.y, digit_w, box.size.h),
-                   mask, on, lcd_dim());
+static GSize seg_block_size(int digits, bool big) {
+  GFont font = big ? s_font_dseg_big : s_font_dseg_small;
+  if (!font) {
+    return GSize(big ? 44 : 22, big ? 30 : 18);
   }
+  const char *ghost = digits >= 3 ? "888" : (digits == 1 ? "8" : "88");
+  return seg_text_size(ghost, font);
 }
 
 /* A BAT-style segmented meter. The reference spends this on battery; here it
@@ -619,6 +668,7 @@ static GRect draw_panel(GContext *ctx, GRect bounds) {
                       bounds.size.h - TOP_CHROME - BOTTOM_CHROME);
   graphics_context_set_fill_color(ctx, lcd_glass());
   graphics_fill_rect(ctx, panel, 2, GCornersAll);
+  stipple_rect(ctx, grect_inset(panel, GEdgeInsets(2)));
   graphics_context_set_stroke_color(ctx, lcd_dim());
   graphics_draw_round_rect(ctx, panel, 2);
   draw_panel_bevel(ctx, panel);
@@ -796,44 +846,46 @@ static void draw_state_mark(GContext *ctx, GRect box, const char *state, bool in
 static void draw_self_test(GContext *ctx, GRect panel, const char *title, const char *hint) {
   /* Nothing to show is still a working instrument: the glass runs its
      all-segments test, which is what a real one does with no data. */
-  int digits = 4;
-  int digit_w = panel.size.w >= 130 ? 22 : 18;
-  int digit_h = 34;
-  int gap = 5;
-  int total_w = digits * digit_w + (digits - 1) * gap + 6;
-  int x = panel.origin.x + (panel.size.w - total_w) / 2;
-  int y = panel.origin.y + 12;
+  GFont font = s_font_dseg_big;
+  int y = panel.origin.y + 10;
+  if (font) {
+    GSize full = seg_text_size("88:88", font);
+    int x = panel.origin.x + (panel.size.w - full.w) / 2;
+    graphics_context_set_text_color(ctx, lcd_ghost_tone());
+    graphics_draw_text(ctx, "88:88", font, GRect(x, y, full.w + 4, full.h + 4),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    hatch_rect(ctx, GRect(x, y, full.w + 2, full.h + 2));
 
-  int lit = (s_stream_phase / 6) % (digits + 3);
-  for (int i = 0; i < digits; i++) {
-    int cx = x + i * (digit_w + gap) + (i >= 2 ? 6 : 0);
-    draw_seg_digit(ctx, GRect(cx, y, digit_w, digit_h),
-                   i == lit ? SEG_ALL : 0, lcd_ink(), lcd_dim());
+    /* One digit lights at a time, walking the field like a power-on test. */
+    static const char *steps[5] = { "8", " 8", "   8", "    8", "" };
+    int lit = (s_stream_phase / 6) % 6;
+    if (lit < 5 && steps[lit][0]) {
+      graphics_context_set_text_color(ctx, lcd_ink());
+      graphics_draw_text(ctx, steps[lit], font, GRect(x, y, full.w + 4, full.h + 4),
+                         GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    }
+    y += full.h + 4;
+  } else {
+    y += 34;
   }
-  int colon_x = x + 2 * (digit_w + gap) - 1;
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(colon_x, y + 10, 3, 3), 0, GCornerNone);
-  graphics_fill_rect(ctx, GRect(colon_x, y + digit_h - 13, 3, 3), 0, GCornerNone);
 
   graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(panel.origin.x + 8, y + digit_h + 10, panel.size.w - 16, 1), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(panel.origin.x + 8, y, panel.size.w - 16, 1), 0, GCornerNone);
 
   graphics_context_set_text_color(ctx, lcd_ink());
   int tw = tracked_width(title, font_legend(), 2);
-  draw_tracked(ctx, title, font_legend(),
-               GPoint(panel.origin.x + (panel.size.w - tw) / 2, y + digit_h + 14), 2);
+  draw_tracked(ctx, title, font_legend(), GPoint(panel.origin.x + (panel.size.w - tw) / 2, y + 3), 2);
 
   graphics_context_set_text_color(ctx, lcd_dim());
   graphics_draw_text(ctx, hint, font_row_detail(),
-                     GRect(panel.origin.x + 6, y + digit_h + 32, panel.size.w - 12, 36),
+                     GRect(panel.origin.x + 6, y + 20, panel.size.w - 12, 34),
                      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 
-  /* Even with nothing to show the instrument reports on itself. */
   char age[12];
   sync_age_text(age, sizeof(age));
   char foot[28];
-  snprintf(foot, sizeof(foot), "%s   SYN %s", BUILD_LABEL, age);
-  int fw = tracked_width(foot, fonts_get_system_font(FONT_KEY_GOTHIC_14), 1);
+  snprintf(foot, sizeof(foot), "%s  SYN %s", BUILD_LABEL, age);
+  int fw = tracked_width(foot, font_row_detail(), 1);
   draw_caption(ctx, foot, GPoint(panel.origin.x + (panel.size.w - fw) / 2,
                                  panel.origin.y + panel.size.h - 17), lcd_dim());
 }
@@ -897,28 +949,27 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   int trio[3] = { host->run, host->idle, host->settled };
   const char *trio_caps[3] = { "R", "I", "S" };
   for (int i = 0; i < 3; i++) {
-    draw_seg_number(ctx, GRect(field.origin.x + 6 + i * 17, field.origin.y + 4, 11, 14),
-                    clamp_int(trio[i], 0, 99), 1, lcd_ink());
+    draw_seg_value(ctx, GPoint(field.origin.x + 6 + i * 17, field.origin.y + 2),
+                   clamp_int(trio[i], 0, 99), 2, lcd_ink(), false);
     draw_caption(ctx, trio_caps[i], GPoint(field.origin.x + 9 + i * 17, field.origin.y + 16), lcd_dim());
   }
 
   /* Field three: the headline. One big segment readout, the way the time
      dominates the reference, with two caption lines beside it. */
-  int big_h = clamp_int(panel.size.h - 92, 30, 44);
-  int big_w = big_h > 38 ? 26 : 22;
   int big_y = panel.origin.y + 42;
   GColor ink = state_color(host->state);
   if (gcolor_equal(ink, lcd_dim())) {
     ink = lcd_ink();
   }
-  draw_seg_number(ctx, GRect(inner_x, big_y, big_w * 2 + 6, big_h),
-                  clamp_int(state_headline_count(host), 0, 99), 2, ink);
+  draw_seg_value(ctx, GPoint(inner_x, big_y), clamp_int(state_headline_count(host), 0, 99),
+                 2, ink, true);
 
-  int label_x = inner_x + big_w * 2 + 14;
+  GSize big_block = seg_block_size(2, true);
+  int label_x = inner_x + big_block.w + 10;
   graphics_context_set_text_color(ctx, lcd_ink());
   draw_tracked(ctx, state_word(host->state), font_legend(), GPoint(label_x, big_y + 2), 1);
   if (state_is(host->state, "offline")) {
-    graphics_draw_text(ctx, s_error_log_count > 0 ? s_error_log[0] : "no answer",
+    graphics_draw_text(ctx, host->detail[0] ? host->detail : "no answer",
                        fonts_get_system_font(FONT_KEY_GOTHIC_14),
                        GRect(label_x, big_y + 14, panel.size.w - (label_x - panel.origin.x) - 8, 30),
                        GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
@@ -1779,6 +1830,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       HostItem *host = &s_hosts[index];
       copy_tuple(host->id, sizeof(host->id), iter, KEY_HOST_ID);
       copy_tuple(host->title, sizeof(host->title), iter, KEY_TITLE);
+      copy_tuple(host->detail, sizeof(host->detail), iter, KEY_DETAIL);
       copy_tuple(host->state, sizeof(host->state), iter, KEY_STATE);
       host->needs = int_tuple(iter, KEY_C_NEEDS, 0);
       host->run = int_tuple(iter, KEY_C_RUN, 0);
@@ -2048,6 +2100,12 @@ static void detail_window_unload(Window *window) {
 }
 
 static void init(void) {
+  s_font_dseg_big = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_34));
+  s_font_dseg_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_16));
+  s_font_tech = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_TECH_18));
+  s_font_tech_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_TECH_14));
+  lcd_tiles_create();
+
   reset_hosts();
   reset_sessions();
   reset_projects();
@@ -2109,6 +2167,11 @@ static void deinit(void) {
   if (s_diag_window) {
     window_destroy(s_diag_window);
   }
+  lcd_tiles_destroy();
+  if (s_font_dseg_big) fonts_unload_custom_font(s_font_dseg_big);
+  if (s_font_dseg_small) fonts_unload_custom_font(s_font_dseg_small);
+  if (s_font_tech) fonts_unload_custom_font(s_font_tech);
+  if (s_font_tech_small) fonts_unload_custom_font(s_font_tech_small);
 }
 
 int main(void) {

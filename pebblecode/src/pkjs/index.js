@@ -1182,6 +1182,17 @@ function refreshHosts() {
       next();
     }, HOST_PROBE_TIMEOUT_MS);
   }, function() {
+    // Log the reason, not just the name: "rejected the token" and "no route"
+    // need different fixes, and the watch is where that is read.
+    var down = [];
+    for (var f = 0; f < rows.length; f++) {
+      if (rows[f] && rows[f].state === "offline") {
+        down.push(rows[f].title + ": " + rows[f].detail);
+      }
+    }
+    if (down.length) {
+      sendError(compact(down.join(" / "), 60));
+    }
     for (var i = 0; i < rows.length; i++) {
       send(makeMessage(CMD_HOST_ITEM, {
         index: i,
@@ -1929,43 +1940,55 @@ function promptNewThread(projectId, text) {
     }
     var now = new Date().toISOString();
     var threadId = randomId("pebble-thread-");
-    // A bootstrapped thread has to name a model, so use the project's default
-    // from the server and only fall back when it has none.
+    // A new thread has to name a model, so use the project's default from the
+    // server and only fall back when it has none.
     var selection = resolveModelSelection(project.defaultModelSelection);
+    // Two commands, not one. `thread.turn.start` accepts a
+    // `bootstrap.createThread` block and the REST route validates it, but only
+    // the WebSocket path routes such a command through the branch that creates
+    // the thread. Over REST the bootstrap is silently ignored and the turn
+    // lands on a thread that does not exist, which the server reports as a 500.
+    // So create the thread first and start the turn against it.
     dispatchCommand(server, {
-      type: "thread.turn.start",
-      commandId: randomId("pebble:turn:"),
+      type: "thread.create",
+      commandId: randomId("pebble:new:"),
       threadId: threadId,
-      message: {
-        messageId: randomId("pebble:"),
-        role: "user",
-        text: prompt,
-        attachments: []
-      },
+      projectId: project.nativeId,
+      title: "New thread",
       modelSelection: selection,
-      titleSeed: compact(text, 58),
       runtimeMode: "full-access",
       interactionMode: "default",
-      bootstrap: {
-        createThread: {
-          projectId: project.nativeId,
-          title: "New thread",
-          modelSelection: selection,
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          branch: null,
-          worktreePath: null,
-          createdAt: now
-        }
-      },
+      branch: null,
+      worktreePath: null,
       createdAt: now
-    }, function(dispatchError) {
-      if (dispatchError) {
-        sendError(dispatchError);
+    }, function(createError) {
+      if (createError) {
+        sendError(createError);
         return;
       }
-      send(makeMessage(CMD_PROMPT, {}));
-      invalidateHost(projectId);
+      dispatchCommand(server, {
+        type: "thread.turn.start",
+        commandId: randomId("pebble:turn:"),
+        threadId: threadId,
+        message: {
+          messageId: randomId("pebble:"),
+          role: "user",
+          text: prompt,
+          attachments: []
+        },
+        modelSelection: selection,
+        titleSeed: compact(text, 58),
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now
+      }, function(dispatchError) {
+        if (dispatchError) {
+          sendError(dispatchError);
+          return;
+        }
+        send(makeMessage(CMD_PROMPT, {}));
+        invalidateHost(projectId);
+      });
     });
   });
 }
