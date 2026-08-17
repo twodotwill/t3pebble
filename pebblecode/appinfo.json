@@ -52,13 +52,13 @@
         "type": "font",
         "name": "FONT_DOT_20",
         "file": "fonts/Dot6x10-2x.ttf",
-        "characterRegex": "[ -~]"
+        "characterRegex": "[ -~…]"
       },
       {
         "type": "font",
         "name": "FONT_DOT_10",
         "file": "fonts/Dot6x10-1x.ttf",
-        "characterRegex": "[ -~]"
+        "characterRegex": "[ -~…]"
       },
       {
         "type": "font",

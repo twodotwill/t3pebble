@@ -34,6 +34,27 @@ def glyph_pixels(face, code, cell_h):
     return rows, g.bitmap_left, g.bitmap_top, g.advance.x // 64
 
 
+def ellipsis_pixels(cell_w, cell_h):
+    """(rows, left, top, advance) for U+2026, which X11 6x10 does not carry.
+
+    The app asks for GTextOverflowModeTrailingEllipsis nearly everywhere, and a
+    Pebble font without U+2026 does not fall back — the firmware's layout never
+    returns and the watch stops answering the protocol entirely. So the glyph is
+    not decoration: it is what stops a long title from hanging the app.
+
+    A 6px cell cannot hold three of the source font's periods, which are 3px
+    plus-shapes. Three single pixels on the same row the period's body sits on
+    is what a real dot-matrix panel does at this size, and it keeps a clear
+    column before the next glyph.
+    """
+    row = [1 if x % 2 == 0 else 0 for x in range(min(5, cell_w - 1))]
+    return [row], 0, 1, cell_w
+
+
+# Codepoints the source bitmap font has no glyph for, drawn in its own idiom.
+SYNTHETIC = {0x2026: ellipsis_pixels}
+
+
 def rectangles(rows):
     """Set pixels as rectangles, merging vertically where a run repeats.
 
@@ -83,8 +104,11 @@ def convert(src, dst, scale, family, codes):
     lsbs = {}
     for code in codes:
         if face.get_char_index(code) == 0 and code != 32:
-            continue
-        rows, left, top, adv = glyph_pixels(face, code, cell_h)
+            if code not in SYNTHETIC:
+                continue
+            rows, left, top, adv = SYNTHETIC[code](cell_w, cell_h)
+        else:
+            rows, left, top, adv = glyph_pixels(face, code, cell_h)
         widths.add(adv)
         name = "uni%04X" % code
         pen = TTGlyphPen(None)
@@ -133,5 +157,5 @@ def convert(src, dst, scale, family, codes):
 
 if __name__ == "__main__":
     src, dst, scale, family = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-    codes = list(range(32, 127)) + list(range(160, 256))  # ASCII + Latin-1
+    codes = list(range(32, 127)) + list(range(160, 256)) + [0x2026]  # ASCII + Latin-1 + ellipsis
     convert(src, dst, scale, family, codes)

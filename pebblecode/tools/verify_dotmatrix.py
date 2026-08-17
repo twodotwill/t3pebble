@@ -60,3 +60,16 @@ if bad:
 print("advances :", sorted(advs), "->", "MONOSPACED" if len(advs) == 1 else "PROPORTIONAL")
 print("stems    :", sorted(stems), "->",
       "all whole multiples of scale" if all(s % scale == 0 for s in stems) else "RAGGED")
+
+# U+2026 has no source glyph to compare against, so it is checked for existence
+# and shape instead. It is the one codepoint whose absence is not cosmetic: the
+# app draws almost everything with GTextOverflowModeTrailingEllipsis, and a font
+# missing this glyph hangs the firmware's text layout outright.
+ell_ink, ell_adv = ink(b, 0x2026)
+dots = sorted({x for (x, y) in ell_ink})
+expected = sorted({x * scale + dx for x in (0, 2, 4) for dx in range(scale)})
+print("ellipsis : U+2026", "present" if ell_ink else "MISSING",
+      "advance", ell_adv, "dot columns", dots,
+      "->", "OK" if dots == expected and ell_adv in advs else "UNEXPECTED")
+if not ell_ink or dots != expected or ell_adv not in advs:
+    sys.exit(1)
