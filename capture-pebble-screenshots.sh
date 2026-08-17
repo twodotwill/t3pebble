@@ -6,8 +6,10 @@ PEBBLE_DIR="$ROOT_DIR/pebblecode"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/dist/pebble-screenshots/$(date +%Y%m%d-%H%M%S)}"
 SDK_IMAGE="${SDK_IMAGE:-rebble/pebble-sdk}"
 EMULATOR="${EMULATOR:-emery}"
-TOTAL_TIMEOUT="${TOTAL_TIMEOUT:-420s}"
+TOTAL_TIMEOUT="${TOTAL_TIMEOUT:-1200s}"
 STEP_TIMEOUT="${STEP_TIMEOUT:-120s}"
+PAGE_HOLD_SCALE="${PAGE_HOLD_SCALE:-4}"
+CAPTURE_TRIES="${CAPTURE_TRIES:-4}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required; the local pebble command is a Docker wrapper and cannot keep one emulator alive across commands." >&2
@@ -38,6 +40,8 @@ EOF
 if ! timeout "$TOTAL_TIMEOUT" docker run --rm \
   -e EMULATOR="$EMULATOR" \
   -e STEP_TIMEOUT="$STEP_TIMEOUT" \
+  -e PAGE_HOLD_SCALE="$PAGE_HOLD_SCALE" \
+  -e CAPTURE_TRIES="$CAPTURE_TRIES" \
   -v "$PEBBLE_DIR:/pebblecode:ro" \
   -v "$OUT_DIR:/shots" \
   -w /pebblecode \
@@ -71,16 +75,30 @@ echo "staging a fixture build in /work/pebblecode"
 mkdir -p /work/pebblecode
 tar -C /pebblecode --exclude=./build --exclude=./.lock-waf_linux_build -cf - . | tar -C /work/pebblecode -xf -
 cd /work/pebblecode
-python2 - <<"PATCH"
+python2 - <<PATCH
 import re
+PAGE_HOLD_SCALE = $PAGE_HOLD_SCALE
 path = "src/pkjs/index.js"
 src = open(path).read()
 patched, count = re.subn(r"var\s+SCREENSHOT_FIXTURES\s*=.*?;",
                          "var SCREENSHOT_FIXTURES = true;", src, count=1, flags=re.S)
 if count != 1:
     raise SystemExit("could not find the SCREENSHOT_FIXTURES declaration in " + path)
+
+# The storyboard timings are stretched for the same reason the captures
+# below retry: a screenshot only lands between painted frames, and on QEMU a
+# frame is slow enough that the handshake often misses. Holding each page four
+# times longer turns a one-shot race into a window several attempts fit inside.
+body = re.search(r"function runScreenshotStoryboard\(\) \{.*?\n\}\n", patched, re.S)
+if not body:
+    raise SystemExit("could not find runScreenshotStoryboard in " + path)
+stretched = re.sub(r"\}, (\d+)\);",
+                   lambda m: "}, %d);" % (int(m.group(1)) * PAGE_HOLD_SCALE),
+                   body.group(0))
+patched = patched.replace(body.group(0), stretched, 1)
+
 open(path, "w").write(patched)
-print("fixtures forced on for this build")
+print("fixtures forced on and storyboard stretched %dx for this build" % PAGE_HOLD_SCALE)
 PATCH
 
 # Every capture is scheduled against the moment the app launches, because that
@@ -102,13 +120,21 @@ FAILED=""
 # and pypkjs as its children, so every later step fails with "Connection
 # refused" rather than a timeout. Captures are non-fatal so a partial set still
 # reaches $OUT_DIR, and the names of the missing ones are reported at the end.
+# A screenshot is only answered between painted frames, and a frame on QEMU is
+# slow enough that a single attempt is a coin flip -- the same build captures
+# one run and times out the next. Each page is held long enough for several
+# tries, so a miss costs an attempt rather than the whole run.
 capture() {
-  local at_ms="$1" name="$2"
+  local at_ms="$1" name="$2" try=1
   wait_until "$at_ms"
-  echo "capturing $name at +${at_ms}ms"
-  if ! timeout "$STEP_TIMEOUT" pebble screenshot --emulator "$EMULATOR" --no-open --no-correction "/shots/$name.png"; then
-    FAILED="$FAILED $name"
-  fi
+  while [ "$try" -le "$CAPTURE_TRIES" ]; do
+    echo "capturing $name at +${at_ms}ms (attempt $try/$CAPTURE_TRIES)"
+    if timeout "$STEP_TIMEOUT" pebble screenshot --emulator "$EMULATOR" --no-open --no-correction "/shots/$name.png"; then
+      return
+    fi
+    try=$(( try + 1 ))
+  done
+  FAILED="$FAILED $name"
 }
 
 pebble kill >/dev/null 2>&1 || true
@@ -125,12 +151,12 @@ T0_MS=$(date +%s%3N)
 # The storyboard sets each page at 1200/4300/8300/12300/16300/19600ms and loads
 # the next screens fixture ~3.3s later, so each capture goes out about 600ms
 # after its page lands, leaving the rest of the window for the transfer.
-capture  1800 00-host-dashboard
-capture  4900 01-thread-list
-capture  8900 02-thread-detail
-capture 12900 03-thread-transcript
-capture 16900 04-diagnostics
-capture 20200 05-host-offline
+capture $((  1800 * PAGE_HOLD_SCALE )) 00-host-dashboard
+capture $((  4900 * PAGE_HOLD_SCALE )) 01-thread-list
+capture $((  8900 * PAGE_HOLD_SCALE )) 02-thread-detail
+capture $(( 12900 * PAGE_HOLD_SCALE )) 03-thread-transcript
+capture $(( 16900 * PAGE_HOLD_SCALE )) 04-diagnostics
+capture $(( 20200 * PAGE_HOLD_SCALE )) 05-host-offline
 
 pebble kill >/dev/null 2>&1 || true
 

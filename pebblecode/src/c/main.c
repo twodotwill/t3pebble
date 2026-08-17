@@ -2568,8 +2568,13 @@ static void reset_projects(void) {
    that, because a shipped app should not accept a command from the phone that
    rearranges its window stack. */
 static void show_screenshot_page(int page) {
-  if (s_host_window) {
-    window_stack_pop_all(false);
+  /* Pop back to the host window, not off it. window_stack_pop_all() empties the
+     stack, and a watchapp with no windows left exits, after which the
+     mark_all_dirty() below runs against freed layers. Popping down to the host
+     window is what the callers below already assume is on the stack. */
+  while (s_host_window && window_stack_get_top_window() &&
+         window_stack_get_top_window() != s_host_window) {
+    window_stack_pop(false);
   }
 
   if (page <= 0) {
