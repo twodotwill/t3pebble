@@ -3,7 +3,7 @@
   "shortName": "t3pebble",
   "longName": "T3 Pebble",
   "companyName": "Pebble",
-  "versionLabel": "0.1",
+  "versionLabel": "0.6",
   "sdkVersion": "3",
   "enableMultiJS": true,
   "targetPlatforms": [
@@ -50,7 +50,19 @@
     "media": [
       {
         "type": "font",
-        "name": "FONT_DSEG_42",
+        "name": "FONT_DOT_20",
+        "file": "fonts/Dot6x10-2x.ttf",
+        "characterRegex": "[ -~]"
+      },
+      {
+        "type": "font",
+        "name": "FONT_DOT_10",
+        "file": "fonts/Dot6x10-1x.ttf",
+        "characterRegex": "[ -~]"
+      },
+      {
+        "type": "font",
+        "name": "FONT_DSEG_64",
         "file": "fonts/DSEG7Classic-Bold.ttf",
         "characterRegex": "[0-9:]"
       },
@@ -59,18 +71,6 @@
         "name": "FONT_DSEG_20",
         "file": "fonts/DSEG7Classic-Bold.ttf",
         "characterRegex": "[0-9:]"
-      },
-      {
-        "type": "font",
-        "name": "FONT_TECH_20",
-        "file": "fonts/ShareTechMono-Regular.ttf",
-        "characterRegex": "[A-Za-z0-9 \u00b7:/.,%+_-]"
-      },
-      {
-        "type": "font",
-        "name": "FONT_TECH_16",
-        "file": "fonts/ShareTechMono-Regular.ttf",
-        "characterRegex": "[A-Za-z0-9 \u00b7:/.,%+_-]"
       }
     ]
   },

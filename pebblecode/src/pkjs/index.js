@@ -1,3 +1,16 @@
+// The wire protocol and the build label are generated from protocol.json by
+// tools/gen-protocol.js, which writes the same table into appinfo.json's
+// appKeys and into main.c. Edit protocol.json, never this block;
+// test/protocol.test.js fails the build if the copies disagree.
+//
+// SCOPE_ACTIVE / SCOPE_SETTLED pick which slice of a host's threads a request
+// wants. Settled covers the snoozed ones too: both mean "not asking for
+// anything right now".
+//
+// BUILD_LABEL is load-bearing -- migrateSettings() rewrites stored settings
+// whenever it changes -- so it lives here with everything else that has to
+// stay in step across the two sides.
+// @generated protocol:begin
 var KEY_CMD = "cmd";
 var KEY_INDEX = "index";
 var KEY_TOTAL = "total";
@@ -22,7 +35,6 @@ var KEY_C_NEEDS = "c_needs";
 var KEY_C_RUN = "c_run";
 var KEY_C_IDLE = "c_idle";
 var KEY_C_SETTLED = "c_settled";
-// Which slice of a host's threads the watch is looking at, and where in it.
 var KEY_SCOPE = "scope";
 var KEY_OFFSET = "offset";
 var KEY_MATCHED = "matched";
@@ -51,25 +63,24 @@ var CMD_PROJECT_NAME = 16;
 var CMD_PROJECT_PREVIEW = 17;
 var CMD_PROJECT_CREATE = 18;
 var CMD_CONCIERGE = 19;
+var CMD_SCREENSHOT_PAGE = 90;
 
-// Which slice of a host's threads a request wants. Settled covers the snoozed
-// ones too: both mean "not asking for anything right now".
 var SCOPE_ACTIVE = 0;
 var SCOPE_SETTLED = 1;
+
+var BUILD_LABEL = "v0.6";
+// @generated protocol:end
 
 var MAX_SESSIONS = 20;
 var SUMMARY_LIMIT = 150;
 var CONTEXT_LIMIT = 480;
 var CONTEXT_MESSAGE_LIMIT = 60;
 var DETAIL_MESSAGE_LIMIT = 10;
-var ENRICH_CONCURRENCY = 4;
-var HYDRATE_CONCURRENCY = 4;
 // Kept equal to MAX_SERVERS so the host list is always one batch. Laptops sleep,
 // and a sleeping host costs a full timeout; batching would make hosts wait
 // behind that instead of alongside it.
 var SERVER_CONCURRENCY = 6;
 var MAX_APP_MESSAGE_FAILURES = 8;
-var BUILD_LABEL = "v0.3.0";
 var DEFAULT_BASE_URL = "";
 var DEFAULT_TOKEN = "";
 var HTTP_TIMEOUT_MS = 20000;
@@ -77,6 +88,9 @@ var HTTP_TIMEOUT_MS = 20000;
 // budget. A shorter ceiling keeps a sleeping laptop from stalling the first
 // paint for every other host.
 var HOST_PROBE_TIMEOUT_MS = 8000;
+// Why a host did not answer is the one thing worth reading off the wrist, so
+// it gets a real sentence. Kept under HostItem.detail on the watch.
+var HOST_FAILURE_LIMIT = 88;
 var MAX_SERVERS = 6;
 // Thread and project ids are namespaced by server so every id the watch sends
 // back can be routed to the machine it came from. SessionItem.id is 72 bytes
@@ -104,17 +118,25 @@ var DEFAULT_SETTINGS = {
   servers: [],
   nextServerId: 1
 };
+// The screenshot storyboard below is phone-side only and unreachable on a
+// handset (there is no `process`), so it costs bundle size and nothing else.
+// The watch half of the rig -- CMD_SCREENSHOT_PAGE, which let the phone
+// rearrange a shipped app's window stack -- is behind SCREENSHOT_BUILD in
+// main.c and is not in the released binary.
+var SCREENSHOT_FIXTURES = typeof process !== "undefined" && process.env &&
+  process.env.T3PEBBLE_SCREENSHOT_FIXTURES === "1";
 
 var appMessageQueue = [];
 var appMessageBusy = false;
 var appMessageFailureCount = 0;
 var pendingBySession = {};
-var runtimeStatusBySession = {};
 var cachedSessions = {};
-var cachedProjects = {};
 var lastSnapshot = null;
-var lastSnapshotFailures = [];
 var shellByServer = {};
+// What was last sent for each host, so an unchanged roll-up costs no radio
+// time. A quiet tailnet used to spend one acknowledged AppMessage per host
+// every five minutes restating numbers the watch already had.
+var lastHostRow = {};
 
 function settings() {
   migrateSettings();
@@ -394,9 +416,83 @@ function randomId(prefix) {
   return prefix + Date.now().toString(36) + random;
 }
 
+// XMLHttpRequest collapses every pre-HTTP failure into status 0 with no
+// detail, which is where the useless "T3 unreachable" came from: a sleeping
+// laptop, a wrong port, a stopped server and a name that will not resolve all
+// arrive looking identical. The phone does know two things it was not saying —
+// which address it dialled, and how long the attempt took — and those separate
+// the cases. A refusal comes back in milliseconds because something actively
+// answered "no"; silence runs to the full timeout because nothing answered.
+var FAST_FAILURE_MS = 2500;
+
+// The address as dialled, so a six-host list says which machine and which port
+// this was. The scheme rides along only when it is https, because that is the
+// `tailscale serve` path and it fails somewhere different from a plain IP.
+function serverAddress(server) {
+  var baseUrl = normalizeBaseUrl(server && server.baseUrl);
+  var host = urlHost(baseUrl);
+  return /^https:/i.test(baseUrl) ? "https://" + host : host;
+}
+
+function looksLikeIpAddress(host) {
+  return /^\d+\.\d+\.\d+\.\d+(:\d+)?$/.test(String(host || ""));
+}
+
+// What to check next, keyed on the shape of the URL, because the two supported
+// setups break in different places. A tailnet HTTPS name is published by
+// `tailscale serve` on the host; a bare tailnet IP goes straight at whatever
+// address `t3 serve` bound to, which is the setting that catches people out
+// when a desktop build only listens on loopback.
+function reachabilityHint(server) {
+  var baseUrl = normalizeBaseUrl(server && server.baseUrl);
+  if (/^https:/i.test(baseUrl)) {
+    return "run tailscale serve there";
+  }
+  return "is t3 serve bound to that address?";
+}
+
+// Whole seconds only. The offline row is suppressed when it is byte-identical
+// to the last poll's, so a sentence carrying millisecond jitter would send a
+// message every single poll and spend exactly the Bluetooth that suppression
+// exists to save. The information in the elapsed time is fast-versus-slow, and
+// that is already carried by which sentence gets chosen.
+function secondsText(ms) {
+  return String(Math.round((ms > 0 ? ms : 0) / 1000)) + "s";
+}
+
+function transportFailure(server, kind, elapsedMs, budgetMs) {
+  var error = buildTransportFailure(server, kind, elapsedMs, budgetMs);
+  // Marks a failure that never reached HTTP, so the caller can tell "this
+  // machine is down" from "this machine said no" — one of those generalises
+  // across hosts and the other does not.
+  error.transport = true;
+  return error;
+}
+
+function buildTransportFailure(server, kind, elapsedMs, budgetMs) {
+  var where = serverAddress(server);
+  if (kind === "timeout") {
+    // The budget, not the measured elapsed: they agree to within a few
+    // milliseconds and only the budget is identical from one poll to the next.
+    return new Error(where + " silent for " + secondsText(budgetMs || elapsedMs) +
+                     " - asleep or off the tailnet");
+  }
+  if (elapsedMs <= FAST_FAILURE_MS) {
+    // Only a bare IP can be called refused without hedging: there is no name
+    // to resolve, so a fast failure is a reset or no route. A hostname might
+    // equally never have resolved, which "no connection" covers and "refused"
+    // would misreport.
+    var verb = looksLikeIpAddress(urlHost(normalizeBaseUrl(server && server.baseUrl)))
+      ? " refused - "
+      : " no connection - ";
+    return new Error(where + verb + reachabilityHint(server));
+  }
+  return new Error(where + " dropped the connection after " + secondsText(elapsedMs));
+}
+
 function httpRequest(server, method, path, body, callback, timeoutMs) {
   if (!server || !server.baseUrl) {
-    callback(new Error("Configure remote URL"));
+    callback(new Error("No base URL set for " + ((server && server.label) || "this server")));
     return;
   }
   if (!server.token) {
@@ -410,6 +506,8 @@ function httpRequest(server, method, path, body, callback, timeoutMs) {
 
   var done = false;
   var request = new XMLHttpRequest();
+  var budgetMs = timeoutMs || HTTP_TIMEOUT_MS;
+  var startedAt = Date.now();
 
   function finish(error, value) {
     if (done) {
@@ -420,14 +518,29 @@ function httpRequest(server, method, path, body, callback, timeoutMs) {
     callback(error, value);
   }
 
+  function failTransport(kind) {
+    finish(transportFailure(server, kind, Date.now() - startedAt, budgetMs));
+  }
+
   var timer = setTimeout(function() {
     try {
       request.abort();
     } catch (e) {
       void e;
     }
-    finish(new Error("T3 request timeout"));
-  }, timeoutMs || HTTP_TIMEOUT_MS);
+    failTransport("timeout");
+  }, budgetMs);
+
+  // Where the runtime implements them, these say which kind of failure it was
+  // instead of leaving it to be inferred from a zero status. Both are additive:
+  // the readystatechange path below and the timer still catch everything on a
+  // runtime that ignores them, and `done` keeps whichever fires first.
+  request.ontimeout = function() {
+    failTransport("timeout");
+  };
+  request.onerror = function() {
+    failTransport("error");
+  };
 
   request.onreadystatechange = function() {
     if (request.readyState !== 4 || done) {
@@ -435,11 +548,11 @@ function httpRequest(server, method, path, body, callback, timeoutMs) {
     }
     var status = request.status;
     if (!status) {
-      finish(new Error("T3 unreachable"));
+      failTransport("error");
       return;
     }
     if (status < 200 || status >= 300) {
-      finish(new Error(httpFailureMessage(status, request.responseText)));
+      finish(new Error(httpFailureMessage(status, request.responseText, server)));
       return;
     }
     var text = trim(request.responseText);
@@ -456,6 +569,9 @@ function httpRequest(server, method, path, body, callback, timeoutMs) {
 
   try {
     request.open(method, httpUrl(server, path), true);
+    // Set after open, which is where XHR requires it. Our own timer stays as
+    // the backstop for runtimes that ignore this.
+    request.timeout = budgetMs;
     request.setRequestHeader("Authorization", "Bearer " + server.token);
     request.setRequestHeader("Accept", "application/json");
     if (body !== null && body !== undefined) {
@@ -467,7 +583,7 @@ function httpRequest(server, method, path, body, callback, timeoutMs) {
   }
 }
 
-function httpFailureMessage(status, responseText) {
+function httpFailureMessage(status, responseText, server) {
   var detail = "";
   try {
     var parsed = JSON.parse(responseText || "");
@@ -484,9 +600,23 @@ function httpFailureMessage(status, responseText) {
     return "Access token is missing a scope" + (detail ? " (" + detail + ")" : "");
   }
   if (status === 404) {
-    return detail === "thread_not_found" ? "Thread not found" : "T3 route not found";
+    if (detail === "thread_not_found") {
+      return "Thread not found";
+    }
+    // A reply arrived, so something is listening — it just is not T3. Naming
+    // the address is what separates "wrong port" from "T3 changed its routes".
+    return "No T3 route at " + serverAddress(server) + " - wrong port?";
   }
-  return "T3 request failed (" + status + (detail ? " " + detail : "") + ")";
+  // The tailnet HTTPS path puts `tailscale serve` in front, and a gateway
+  // error from it means the host is reachable but nothing is listening behind
+  // the proxy — a different fix from anything else here. Only claimed on that
+  // path: over plain HTTP there is no proxy to name.
+  if ((status === 502 || status === 503 || status === 504) &&
+      /^https:/i.test(normalizeBaseUrl(server && server.baseUrl))) {
+    return "tailscale serve is up at " + serverAddress(server) +
+           " but t3 serve is not (" + status + ")";
+  }
+  return serverAddress(server) + " failed with " + status + (detail ? " " + detail : "");
 }
 
 // Fans out across every configured server and folds the replies into one
@@ -629,6 +759,10 @@ function flushMessages() {
     flushMessages();
   }, function() {
     appMessageFailureCount++;
+    // A host row that was skipped as unchanged is only correct if the watch
+    // actually holds the previous one. Once anything has failed to land that
+    // is no longer safe to assume, so the next poll resends every row.
+    lastHostRow = {};
     if (appMessageFailureCount <= MAX_APP_MESSAGE_FAILURES) {
       appMessageQueue.unshift(message);
     } else {
@@ -650,6 +784,10 @@ function sendStatus(message) {
   send(makeMessage(CMD_STATUS, {
     status: compact(message, 56)
   }));
+}
+
+function sendScreenshotPage(index) {
+  send(makeMessage(CMD_SCREENSHOT_PAGE, { index: index }));
 }
 
 function makeMessage(command, fields) {
@@ -1205,6 +1343,10 @@ function hostDetailLine(state, counts) {
 }
 
 function refreshHosts() {
+  if (SCREENSHOT_FIXTURES) {
+    fixtureRefreshHosts();
+    return;
+  }
   var servers = configuredServers();
   if (servers.length === 0) {
     sendStatus("Add a server");
@@ -1222,7 +1364,10 @@ function refreshHosts() {
           id: server.id,
           title: server.label,
           state: "offline",
-          detail: compact(String(error.message || error), 34),
+          // The offline host screen gives the reason the whole panel, so send
+          // the sentence rather than the fragment that fit beside a readout.
+          detail: compact(String(error.message || error), HOST_FAILURE_LIMIT),
+          transport: !!error.transport,
           counts: { needs: 0, run: 0, idle: 0, settled: 0 }
         };
         next();
@@ -1248,18 +1393,33 @@ function refreshHosts() {
     }, HOST_PROBE_TIMEOUT_MS);
   }, function() {
     // Log the reason, not just the name: "rejected the token" and "no route"
-    // need different fixes, and the watch is where that is read.
-    var down = [];
+    // need different fixes, and the watch is where that is read. One fault per
+    // host, not one joined line: the fault log keeps six entries, so two down
+    // machines should cost two of them rather than share a truncated one.
+    var unreachable = 0;
     for (var f = 0; f < rows.length; f++) {
       if (rows[f] && rows[f].state === "offline") {
-        down.push(rows[f].title + ": " + rows[f].detail);
+        sendError(rows[f].title + ": " + rows[f].detail);
+        if (rows[f].transport) {
+          unreachable++;
+        }
       }
     }
-    if (down.length) {
-      sendError(compact(down.join(" / "), 60));
+    // Every machine failing to answer at once is not six coincidences; it is
+    // one link. Sent last so it sits at the top of a newest-first fault log,
+    // above the six rows that are all really saying this. Only worth stating
+    // when there is more than one host to generalise from.
+    if (rows.length > 1 && unreachable === rows.length) {
+      sendError("All " + rows.length + " hosts unreachable - is Tailscale on for the phone?");
     }
+    // Bluetooth is the other big battery consumer, and a poll that restates
+    // unchanged numbers spends it for nothing. Skip a host whose row is
+    // byte-identical to the one the watch already has; CMD_HOST_END still goes
+    // every time, because that is what stamps the sync age and re-arms the
+    // watch's refresh timer.
+    var next = {};
     for (var i = 0; i < rows.length; i++) {
-      send(makeMessage(CMD_HOST_ITEM, {
+      var message = makeMessage(CMD_HOST_ITEM, {
         index: i,
         total: rows.length,
         hostId: rows[i].id,
@@ -1267,8 +1427,17 @@ function refreshHosts() {
         detail: rows[i].detail,
         state: rows[i].state,
         counts: rows[i].counts
-      }));
+      });
+      var fingerprint = JSON.stringify(message);
+      next[rows[i].id] = fingerprint;
+      if (lastHostRow[rows[i].id] !== fingerprint) {
+        send(message);
+      }
     }
+    // Only remember what actually went out this round, so a host that drops
+    // out of settings cannot leave a fingerprint that suppresses its own row
+    // if it comes back unchanged.
+    lastHostRow = next;
     send(makeMessage(CMD_HOST_END, { total: rows.length }));
   });
 }
@@ -1276,6 +1445,10 @@ function refreshHosts() {
 // --- one host's threads -----------------------------------------------
 
 function selectHost(hostId, scope, offset) {
+  if (SCREENSHOT_FIXTURES) {
+    fixtureSelectHost(hostId, scope, offset);
+    return;
+  }
   var server = serverById(hostId);
   scope = scope === SCOPE_SETTLED ? SCOPE_SETTLED : SCOPE_ACTIVE;
   offset = offset > 0 ? offset : 0;
@@ -1332,6 +1505,204 @@ function selectHost(hostId, scope, offset) {
     shellByServer[hostId] = tagSnapshot(server, snapshot);
     emit(shellByServer[hostId]);
   });
+}
+
+// --- screenshot fixtures -------------------------------------------------
+
+var FIXTURE_HOSTS = [
+  {
+    id: "shot-host-main",
+    title: "WORKBENCH",
+    detail: "2 need you",
+    state: "needs",
+    counts: { needs: 2, run: 1, idle: 3, settled: 8 }
+  },
+  {
+    id: "shot-host-lab",
+    title: "LAB",
+    detail: "1 running",
+    state: "run",
+    counts: { needs: 0, run: 1, idle: 2, settled: 4 }
+  },
+  // A machine that did not answer, carrying the kind of sentence the real
+  // probe produces. The offline screen is the one that has to stay legible
+  // when the app is least able to explain itself, so it gets captured too.
+  {
+    id: "shot-host-remote",
+    title: "REMOTE",
+    detail: "T3 rejected the access token (session_expired)",
+    state: "offline",
+    counts: { needs: 0, run: 0, idle: 0, settled: 0 }
+  }
+];
+
+var FIXTURE_ACTIVE_SESSIONS = [
+  {
+    id: "shot-host-main::thread-approval",
+    title: "Approve screenshot capture",
+    detail: "needs permission",
+    state: "needs",
+    agent: "codex",
+    summary: "Needs permission to run the Pebble screenshot tool against the emery emulator. The approval row should show dense but readable wrist text.",
+    requestId: "req-permission",
+    requestKind: "permission",
+    settled: false
+  },
+  {
+    id: "shot-host-main::thread-running",
+    title: "Refine Casio dashboard",
+    detail: "running now",
+    state: "run",
+    agent: "gpt-5.6",
+    summary: "The design pass is comparing the host dashboard, thread list, detail summary, transcript page, and diagnostics page for Casio LCD consistency.",
+    requestId: "",
+    requestKind: "",
+    settled: false
+  },
+  {
+    id: "shot-host-main::thread-idle",
+    title: "Polish response layout",
+    detail: "idle 12m",
+    state: "idle",
+    agent: "codex",
+    summary: "The response screen needs enough body copy to prove wrapping, footer placement, and contrast on the warm LCD substrate.",
+    requestId: "",
+    requestKind: "",
+    settled: false
+  },
+  {
+    id: "shot-host-main::thread-error",
+    title: "Long filename overflow",
+    detail: "error",
+    state: "err",
+    agent: "codex",
+    summary: "Error: fixture deliberately exercises alert coloring, truncation, and tight row spacing.",
+    requestId: "",
+    requestKind: "",
+    settled: false
+  }
+];
+
+var FIXTURE_SETTLED_SESSIONS = [
+  {
+    id: "shot-host-main::thread-settled",
+    title: "Archived refactor notes",
+    detail: "settled 2h",
+    state: "settled",
+    agent: "codex",
+    summary: "Done. The settled list should keep the same LCD row style while feeling lower priority.",
+    requestId: "",
+    requestKind: "",
+    settled: true
+  }
+];
+
+var FIXTURE_PROJECTS = [
+  { id: "shot-host-main::project-watch", title: "t3pebble", directory: "~/Projects/t3pebble" },
+  { id: "shot-host-main::project-lab", title: "watch-lab", directory: "~/Projects/watch-lab" }
+];
+
+var FIXTURE_CONTEXT = [
+  "You\nMake a repeatable screenshot rig for the Pebble Time 2 app so design changes can be judged from real emulator pixels.",
+  "Agent\nI added a fixture storyboard that loads representative hosts, active threads, projects, detail content, and transcript text. It advances the watch through the major screens on a timer while the capture script saves PNG files.",
+  "You\nKeep the ending readable from the actual watch.",
+  "Agent\nThe final five sentences are intentionally short. They state what changed, where the screenshots go, and whether any user input is needed."
+].join("\n\n");
+
+function fixtureRefreshHosts() {
+  for (var i = 0; i < FIXTURE_HOSTS.length; i++) {
+    send(makeMessage(CMD_HOST_ITEM, {
+      index: i,
+      total: FIXTURE_HOSTS.length,
+      hostId: FIXTURE_HOSTS[i].id,
+      title: FIXTURE_HOSTS[i].title,
+      detail: FIXTURE_HOSTS[i].detail,
+      state: FIXTURE_HOSTS[i].state,
+      counts: FIXTURE_HOSTS[i].counts
+    }));
+  }
+  send(makeMessage(CMD_HOST_END, { total: FIXTURE_HOSTS.length }));
+}
+
+function fixtureSelectHost(hostId, scope, offset) {
+  void hostId;
+  scope = scope === SCOPE_SETTLED ? SCOPE_SETTLED : SCOPE_ACTIVE;
+  offset = offset > 0 ? offset : 0;
+  var sessions = scope === SCOPE_SETTLED ? FIXTURE_SETTLED_SESSIONS : FIXTURE_ACTIVE_SESSIONS;
+  var other = scope === SCOPE_SETTLED ? FIXTURE_ACTIVE_SESSIONS.length : FIXTURE_SETTLED_SESSIONS.length;
+  sendSessionItems(sessions, {
+    scope: scope,
+    offset: offset,
+    matched: sessions.length,
+    other: other
+  });
+  sendProjectItems(FIXTURE_PROJECTS);
+}
+
+function fixtureDetail(sessionId, index) {
+  var item = fixtureSessionById(sessionId) || FIXTURE_ACTIVE_SESSIONS[index || 0];
+  if (!item) {
+    sendError("No fixture thread");
+    return;
+  }
+  send(makeMessage(CMD_DETAIL, itemFields(item, index || 0, 1)));
+}
+
+function fixtureContext(sessionId, index, page, requestId) {
+  var pages = paginateText(FIXTURE_CONTEXT, CONTEXT_LIMIT);
+  var pageIndex = clampPage(page, pages.length);
+  send(makeMessage(CMD_CONTEXT, {
+    index: index || 0,
+    id: sessionId || FIXTURE_ACTIVE_SESSIONS[0].id,
+    total: pages.length,
+    contextPage: pageIndex,
+    requestId: requestId || "",
+    context: pages[pageIndex]
+  }));
+}
+
+function fixtureSessionById(sessionId) {
+  var all = FIXTURE_ACTIVE_SESSIONS.concat(FIXTURE_SETTLED_SESSIONS);
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].id === sessionId) {
+      return all[i];
+    }
+  }
+  return null;
+}
+
+function runScreenshotStoryboard() {
+  refreshHosts();
+  setTimeout(function() {
+    sendScreenshotPage(0);
+  }, 1200);
+  setTimeout(function() {
+    fixtureSelectHost(FIXTURE_HOSTS[0].id, SCOPE_ACTIVE, 0);
+  }, 3600);
+  setTimeout(function() {
+    sendScreenshotPage(1);
+  }, 4300);
+  setTimeout(function() {
+    fixtureDetail(FIXTURE_ACTIVE_SESSIONS[0].id, 0);
+  }, 7600);
+  setTimeout(function() {
+    sendScreenshotPage(2);
+  }, 8300);
+  setTimeout(function() {
+    fixtureContext(FIXTURE_ACTIVE_SESSIONS[0].id, 0, 0, "shot-context");
+  }, 11600);
+  setTimeout(function() {
+    sendScreenshotPage(3);
+  }, 12300);
+  setTimeout(function() {
+    sendError("Fixture fault for diag");
+  }, 15600);
+  setTimeout(function() {
+    sendScreenshotPage(4);
+  }, 16300);
+  setTimeout(function() {
+    sendScreenshotPage(5);
+  }, 19600);
 }
 
 
@@ -1606,6 +1977,10 @@ function itemFields(item, index, total) {
 }
 
 function detail(sessionId, index) {
+  if (SCREENSHOT_FIXTURES) {
+    fixtureDetail(sessionId, index);
+    return;
+  }
   // Lifecycle and body come from different routes. hasPendingApprovals,
   // hasPendingUserInput, latestUserMessageAt and backgroundLiveness exist only
   // on the shell model, so classifying from the detail thread alone makes the
@@ -1672,6 +2047,10 @@ function sendThreadDetail(sessionId, index, lifecycle, thread) {
 }
 
 function context(sessionId, index, page, requestId) {
+  if (SCREENSHOT_FIXTURES) {
+    fixtureContext(sessionId, index, page, requestId);
+    return;
+  }
   loadMessages(sessionId, CONTEXT_MESSAGE_LIMIT, "", function(error, response) {
     if (error) {
       sendError(error);
@@ -2305,6 +2684,17 @@ function parseServerBundle(text) {
   return found;
 }
 
+// JSON dropped straight into a <script> can close it early: a token or label
+// containing "</script>" would end the block and spill the rest of the page as
+// markup. Escaping the slash keeps the string identical to the parser and
+// inert to the tokenizer. U+2028/9 are legal in JSON but not in JS source.
+function embedJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
 function configurationHtml() {
   var current = settings();
   var seed = current.servers.length ? current.servers : [{ id: "", label: "", baseUrl: "", token: "", projectRoot: "", concierge: "" }];
@@ -2334,7 +2724,7 @@ function configurationHtml() {
     "<button onclick='save()'>Save</button>",
     "<script>",
     "var MAX=", String(MAX_SERVERS), ";",
-    "var servers=", JSON.stringify(seed), ";",
+    "var servers=", embedJson(seed), ";",
     "var parseServerBundle=", String(parseServerBundle), ";",
     "function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}",
     "function render(){var h='';for(var i=0;i<servers.length;i++){var s=servers[i];",
@@ -2375,6 +2765,10 @@ function configurationHtml() {
 }
 
 Pebble.addEventListener("ready", function() {
+  if (SCREENSHOT_FIXTURES) {
+    runScreenshotStoryboard();
+    return;
+  }
   refreshHosts();
 });
 
@@ -2422,6 +2816,9 @@ Pebble.addEventListener("webviewclosed", function(event) {
   try {
     saveSettings(JSON.parse(decodeURIComponent(event.response)));
     shellByServer = {};
+    // A host may have been added, removed or relabelled, so nothing the watch
+    // is holding can be assumed still current.
+    lastHostRow = {};
     refreshHosts();
   } catch (e) {
     sendError("Settings not saved");

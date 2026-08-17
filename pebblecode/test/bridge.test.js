@@ -11,6 +11,7 @@ let sentMessages = []
 let requests = []
 let dispatches = []
 let shells = {}
+let deadHosts = new Set()
 
 const HOST_A = "100.64.0.10:3773"
 const HOST_B = "100.64.0.11:3773"
@@ -138,6 +139,17 @@ class FakeXMLHttpRequest {
     this.headers[String(name).toLowerCase()] = value
   }
   send(body) {
+    // A host in `deadHosts` never reaches HTTP, which is what an asleep laptop
+    // or a stopped server looks like: status 0 and nothing else to go on.
+    const host = (this.url.match(/^https?:\/\/([^/]+)/) || [])[1] || ""
+    if (deadHosts.has(host)) {
+      setTimeout(() => {
+        this.readyState = 4
+        this.status = 0
+        if (this.onerror) this.onerror()
+      }, 0)
+      return
+    }
     const response = routeRequest(this.method, this.url, body)
     requests[requests.length - 1].headers = this.headers
     setTimeout(() => {
@@ -347,6 +359,37 @@ async function main() {
   assert.strictEqual(context.httpFailureMessage(401, JSON.stringify({ reason: "invalid_credential" })), "T3 rejected the access token (invalid_credential)")
   assert.strictEqual(context.httpFailureMessage(404, JSON.stringify({ reason: "thread_not_found" })), "Thread not found")
 
+  // A reply that is not T3, and a gateway error from the proxy in front of it,
+  // are different faults with different fixes, and both name the address.
+  const ipServer = { id: "s1", label: "beta1", baseUrl: "http://" + HOST_A, token: "t" }
+  const serveServer = { id: "s2", label: "mini", baseUrl: "https://mini.tail1234.ts.net", token: "t" }
+  assert.strictEqual(context.httpFailureMessage(404, "", ipServer), `No T3 route at ${HOST_A} - wrong port?`)
+  assert.match(context.httpFailureMessage(502, "", serveServer), /^tailscale serve is up at https:\/\/mini\.tail1234\.ts\.net but t3 serve is not \(502\)$/)
+  assert.strictEqual(context.httpFailureMessage(500, "", ipServer), `${HOST_A} failed with 500`)
+
+  // XHR reports every pre-HTTP failure as status 0, so the address dialled and
+  // the time it took are the whole diagnosis. Silence to the timeout means the
+  // machine never answered; a fast failure means something answered "no".
+  const transport = (server, kind, ms) => context.transportFailure(server, kind, ms).message
+  assert.strictEqual(transport(ipServer, "timeout", 8000), `${HOST_A} silent for 8s - asleep or off the tailnet`)
+  assert.strictEqual(transport(ipServer, "error", 380), `${HOST_A} refused - is t3 serve bound to that address?`)
+  assert.strictEqual(transport(ipServer, "error", 4200), `${HOST_A} dropped the connection after 4s`)
+  // A name might never have resolved, so it is not called refused.
+  assert.match(transport(serveServer, "error", 420), /^https:\/\/mini\.tail1234\.ts\.net no connection - run tailscale serve there$/)
+  assert.match(transport(serveServer, "timeout", 8000), /silent for 8s - asleep or off the tailnet$/)
+  // Only pre-HTTP failures generalise across hosts; a rejected token does not.
+  assert.strictEqual(context.transportFailure(ipServer, "error", 380).transport, true)
+
+  // Every sentence has to survive the trip to the glass intact.
+  for (const kind of ["timeout", "error"]) {
+    for (const server of [ipServer, serveServer]) {
+      for (const ms of [380, 4200, 8000]) {
+        assert.ok(transport(server, kind, ms).length <= context.HOST_FAILURE_LIMIT,
+          `too long for HostItem.detail: ${transport(server, kind, ms)}`)
+      }
+    }
+  }
+
   // ------------------------------------------------------- the host screen
   storedSettings = settingsFor([
     { id: "s1", label: "beta1", baseUrl: "http://" + HOST_A, token: "token-a" },
@@ -391,6 +434,45 @@ async function main() {
   const offline = sentMessages.filter((m) => m.cmd === CMD.hostItem).find((m) => m.host_id === "s2")
   assert.strictEqual(offline.state, "offline")
   assert.ok(offline.detail.length > 0)
+  // The reason names the machine that failed, and the fault log gets one entry
+  // per down host rather than a single joined line.
+  assert.ok(offline.detail.includes(HOST_B), `offline detail should name the address: ${offline.detail}`)
+  const faults = sentMessages.filter((m) => m.cmd === CMD.error)
+  assert.strictEqual(faults.length, 1)
+  assert.ok(faults[0].error.startsWith("mini: "), faults[0].error)
+  // A 502 is the server answering, not the link failing, so the bridge must not
+  // escalate it into a claim about the phone's tailnet.
+  assert.ok(!faults.some((m) => /All \d+ hosts unreachable/.test(m.error)),
+    "an HTTP reply is not a transport failure")
+
+  // Nothing answering at all: the case that used to read "T3 unreachable" for
+  // every host and every cause alike.
+  deadHosts = new Set([HOST_A, HOST_B])
+  sentMessages = []
+  context.shellByServer = {}
+  context.refreshHosts()
+  await waitFor(() => sentMessages.find((m) => m.cmd === CMD.hostEnd), "hostEnd-dead")
+  const dead = sentMessages.filter((m) => m.cmd === CMD.error).map((m) => m.error)
+  assert.strictEqual(dead.length, 3, dead.join(" | "))
+  assert.strictEqual(dead[0], `beta1: ${HOST_A} refused - is t3 serve bound to that address?`)
+  assert.strictEqual(dead[1], `mini: ${HOST_B} refused - is t3 serve bound to that address?`)
+  // Six machines failing at once is one link, not six faults, and it is stated
+  // last so a newest-first log puts it on top.
+  assert.strictEqual(dead[2], "All 2 hosts unreachable - is Tailscale on for the phone?")
+  const deadRows = sentMessages.filter((m) => m.cmd === CMD.hostItem)
+  assert.strictEqual(deadRows.length, 2)
+  assert.ok(deadRows.every((m) => m.state === "offline" && m.detail.includes("refused - ")))
+
+  // The reason has to be byte-identical from one poll to the next or row
+  // suppression never fires and a down host costs a Bluetooth send every
+  // cycle. This is why the sentences carry no measured milliseconds.
+  sentMessages = []
+  context.shellByServer = {}
+  context.refreshHosts()
+  await waitFor(() => sentMessages.find((m) => m.cmd === CMD.hostEnd), "hostEnd-dead-again")
+  assert.strictEqual(sentMessages.filter((m) => m.cmd === CMD.hostItem).length, 0,
+    "an unchanged offline row must not be re-sent")
+  deadHosts = new Set()
 
   // ----------------------------------------------------- the thread screen
   shells[HOST_B] = shellSnapshot({

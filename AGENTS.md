@@ -6,6 +6,7 @@ Run Pebble bridge checks and build from `pebblecode/`:
 
 ```sh
 node --check src/pkjs/index.js
+node test/protocol.test.js
 node test/bridge.test.js
 node test/bridge.integration.test.js
 pebble build
@@ -25,7 +26,19 @@ The app runs against stock T3 Code (the published `t3` CLI). Do not patch T3 Cod
 
 Thread lists are scoped: `SCOPE_ACTIVE` (0) or `SCOPE_SETTLED` (1), carried on `CMD_SELECT_HOST` with an offset. `CMD_SESSION_END` reports `scope`, `offset`, `matched` (the scope's total) and `other` (the opposite scope's total), which is everything the watch needs to label its footer rows without a second request. Footer rows are derived in `rebuild_footers()`, never sent.
 
-New protocol keys must be added to BOTH `appinfo.json` `appKeys` and the `#define KEY_*` block in `main.c`, with matching numbers — the JS side uses string keys and the C side numeric ones.
+`XMLHttpRequest` reports every pre-HTTP failure as status 0 with nothing else, so a sleeping laptop, a wrong port, a stopped server and an unresolvable name all used to arrive as `T3 unreachable`. `transportFailure()` reconstructs the diagnosis from the two things the phone does know — the address it dialled and how long the attempt took: silence to the full timeout is a machine that never answered, a fast failure is something answering "no". Errors it raises are tagged `transport`, which is what lets `refreshHosts()` say "all N hosts unreachable" — an HTTP reply, 502 included, is the server talking and must never be escalated into a claim about the link. None of these sentences may carry measured milliseconds: an offline row that differs byte-for-byte each poll defeats the row suppression below and spends Bluetooth every cycle, which `bridge.test.js` asserts against directly.
+
+Host failures are per-host, never global: `refreshHosts()` turns a failed probe into an `offline` row carrying the reason and keeps going, and it logs one fault per down machine rather than one joined line, so two dead hosts cost two of the six fault-log slots instead of sharing a truncated one. The watch gives an offline host the whole panel for that sentence — the counts trio and the 64pt headline are dropped, since they would only read zero — and SELECT on an offline row retries the probe instead of opening a thread list that would sit out the full request timeout. Keep `HOST_FAILURE_LIMIT` (bridge), `HostItem.detail` and `ERROR_TEXT_MAX` (watch) in step; the smallest of them is what actually reaches the glass.
+
+`pebblecode/protocol.json` is the single source of truth for the wire protocol and the build label. Add a key there, run `node tools/gen-protocol.js`, and it writes the generated blocks in `appinfo.json` `appKeys`, `main.c` and `src/pkjs/index.js` — the JS side uses string keys and the C side numeric ones, and both are emitted from the same table. Never hand-edit inside a `@generated protocol:begin/end` block. `node test/protocol.test.js` fails if any copy has drifted, and it also checks that the bridge's truncation limits fit inside the watch's fields (`HOST_FAILURE_LIMIT`/`HostItem.detail`, `SUMMARY_LIMIT`/`SessionItem.summary`, `sendError`/`ERROR_TEXT_MAX`).
+
+`versionLabel` in `appinfo.json` is `buildLabel` with the leading `v` stripped, so keep `buildLabel` to `vMajor.Minor` — the SDK rejects a three-component version.
+
+The animation timer runs at two rates, and the split is what keeps the app open without draining the watch. `BUSY_TICK_MS` (110 ms) applies only while something is in flight — that is the busy rail and the loading skeletons, and it is transient. Everything else, meaning the pulsing state mark, gets `IDLE_TICK_MS` (440 ms). `s_stream_phase` advances by `IDLE_TICK_STEP` on a slow tick, so every consumer's existing divisor still lands on the same on-glass rate; do not "fix" a divisor to compensate. The pulse lives on `s_host_pulse_layer`, a 13x13 child positioned from `host_mark_box()`, so an idle tick repaints eleven pixels rather than the whole panel — `host_layer_update_proc` therefore draws the mark itself only when that layer is hidden. `app_focus_service` stops the timer entirely when the app is not on the glass. `/code-review`-style changes to any of this should be judged against `FRM` and the frames-per-second readout on the DIAG page, which is there to measure exactly this.
+
+Requests in flight are one bitmask, `s_busy`, not five booleans, and every failure path goes through `enter_error_state()` — which clears the mask, releases the connecting screen, logs the fault and re-arms the refresh timer on `RETRY_INTERVAL_MS`. Do not clear busy flags by hand in a new error branch; the reason `enter_error_state` exists is that the two old paths cleared different subsets and neither rescheduled a poll.
+
+`refreshHosts()` skips sending a `CMD_HOST_ITEM` whose fields are unchanged since the last poll, so `CMD_HOST_END`'s `total` is authoritative for `s_host_count` and index 0 no longer resets the list. Any new suppression has to keep that pairing, and `lastHostRow` must be cleared whenever the watch might not be holding what the phone thinks it is (a failed send, a settings change).
 
 `ActionMenuDidCloseCb`'s second parameter is the performed `ActionMenuItem`, not the root level, despite the SDK's doc comment. Pass the level through `ActionMenuConfig.context` so `action_menu_hierarchy_destroy` has something to free.
 
@@ -35,7 +48,11 @@ Multi-host setup goes through one pasteable line per machine, `t3pebble1|<label>
 
 ## Watch Install
 
-The local `pebble` command is a Docker wrapper. Use repo-relative PBW paths, not host absolute paths, when calling Pebble SDK commands.
+`pebble` is Core Devices' pebble-tool 5.x, installed natively with `uv tool install --python 3.13 pebble-tool` and then `pebble sdk install latest`. It is no longer the `rebble/pebble-sdk` Docker wrapper, so the old rule about repo-relative PBW paths is gone — absolute host paths work. The previous wrapper is kept at `~/.local/bin/pebble-docker` if a build ever has to be reproduced against SDK 4.3.
+
+SDK 4.33.1 builds with GCC 14 rather than 4.7.2. That turns on a lot of diagnostics the old toolchain never emitted, `-Wformat-truncation=` in particular; fix those by bounding the value rather than reaching for `ctx.pbl_suppress_newer_gcc_warnings()` in the wscript, which exists but hides real truncation. Pebble Time 2 is still the `emery` platform, so the `#error` guard on `PBL_DISPLAY_WIDTH`/`HEIGHT` and the 200x228 layout constants are unchanged.
+
+The linker's "LOAD segment with RWX permissions" warning is inherent to the Pebble app binary format and is not actionable.
 
 Normal install path:
 

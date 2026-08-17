@@ -51,6 +51,7 @@ fi
 
 cd "$PEBBLE_DIR"
 node --check src/pkjs/index.js
+node test/protocol.test.js
 node test/bridge.test.js
 node test/bridge.integration.test.js
 pebble build
@@ -140,6 +141,7 @@ const manifest = {
   verification: {
     checks: [
       "node --check src/pkjs/index.js",
+      "node test/protocol.test.js",
       "node test/bridge.test.js",
       "node test/bridge.integration.test.js",
       "pebble build",

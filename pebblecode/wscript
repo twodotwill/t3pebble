@@ -18,9 +18,17 @@ def build(ctx):
     build_worker = os.path.exists('worker_src')
     binaries = []
 
+    # CMD_SCREENSHOT_PAGE lets the phone rearrange the watch's window stack,
+    # which is exactly what the capture rig needs and exactly what a released
+    # app should not accept. capture-pebble-screenshots.sh sets this; a normal
+    # `pebble build` leaves the command out of the binary entirely.
+    screenshot_build = os.environ.get('T3PEBBLE_SCREENSHOT_FIXTURES') == '1'
+
     cached_env = ctx.env
     for platform in ctx.env.TARGET_PLATFORMS:
         ctx.env = ctx.all_envs[platform]
+        if screenshot_build:
+            ctx.env.append_value('DEFINES', 'SCREENSHOT_BUILD')
         ctx.set_group(ctx.env.PLATFORM_NAME)
         app_elf = '{}/pebble-app.elf'.format(ctx.env.BUILD_DIR)
         ctx.pbl_build(source=ctx.path.ant_glob('src/c/**/*.c'), target=app_elf, bin_type='app')

@@ -1,0 +1,69 @@
+{
+  "//": "The single source of truth for the watch/phone wire protocol and the build label. Edit this file, then run `node tools/gen-protocol.js`. `node test/protocol.test.js` fails if the generated blocks in appinfo.json, src/c/main.c and src/pkjs/index.js have drifted from it.",
+
+  "//buildLabel": "Two components only: the Pebble SDK rejects a versionLabel that is not Major or Major.Minor, and appinfo.json takes this with the leading v stripped.",
+  "buildLabel": "v0.6",
+
+  "keys": [
+    { "name": "cmd", "id": 0, "c": "KEY_CMD" },
+    { "name": "index", "id": 1, "c": "KEY_INDEX" },
+    { "name": "total", "id": 2, "c": "KEY_TOTAL" },
+    { "name": "session_id", "id": 3, "c": "KEY_SESSION_ID" },
+    { "name": "title", "id": 4, "c": "KEY_TITLE" },
+    { "name": "directory", "id": 5, "c": "KEY_DIRECTORY" },
+    { "name": "agent", "id": 6, "c": "KEY_AGENT" },
+    { "name": "status", "id": 7, "c": "KEY_STATUS" },
+    { "name": "summary", "id": 8, "c": "KEY_SUMMARY" },
+    { "name": "context", "id": 9, "c": "KEY_CONTEXT" },
+    { "name": "prompt", "id": 10, "c": "KEY_PROMPT" },
+    { "name": "error", "id": 11, "c": "KEY_ERROR" },
+    { "name": "request_id", "id": 12, "c": "KEY_REQUEST_ID" },
+    { "name": "request_kind", "id": 13, "c": "KEY_REQUEST_KIND" },
+    { "name": "project_id", "id": 14, "c": "KEY_PROJECT_ID" },
+    { "name": "context_page", "id": 15, "c": "KEY_CONTEXT_PAGE" },
+    { "name": "server", "id": 16, "c": "KEY_SERVER" },
+    { "name": "state", "id": 17, "c": "KEY_STATE" },
+    { "name": "host_id", "id": 18, "c": "KEY_HOST_ID" },
+    { "name": "detail", "id": 19, "c": "KEY_DETAIL" },
+    { "name": "c_needs", "id": 20, "c": "KEY_C_NEEDS" },
+    { "name": "c_run", "id": 21, "c": "KEY_C_RUN" },
+    { "name": "c_idle", "id": 22, "c": "KEY_C_IDLE" },
+    { "name": "c_settled", "id": 23, "c": "KEY_C_SETTLED" },
+    { "name": "scope", "id": 24, "c": "KEY_SCOPE" },
+    { "name": "offset", "id": 25, "c": "KEY_OFFSET" },
+    { "name": "matched", "id": 26, "c": "KEY_MATCHED" },
+    { "name": "other", "id": 27, "c": "KEY_OTHER" },
+    { "name": "settled", "id": 28, "c": "KEY_SETTLED" },
+    { "name": "action", "id": 29, "c": "KEY_ACTION" },
+    { "name": "path", "id": 30, "c": "KEY_PATH" },
+    { "name": "name", "id": 31, "c": "KEY_NAME" }
+  ],
+
+  "commands": [
+    { "name": "REFRESH", "id": 1 },
+    { "name": "SESSION_ITEM", "id": 2 },
+    { "name": "SESSION_END", "id": 3 },
+    { "name": "DETAIL", "id": 4 },
+    { "name": "PROMPT", "id": 5 },
+    { "name": "ERROR", "id": 6 },
+    { "name": "CONTEXT", "id": 7 },
+    { "name": "STATUS", "id": 8 },
+    { "name": "PROJECT_ITEM", "id": 9 },
+    { "name": "PROJECT_END", "id": 10 },
+    { "name": "NEW_THREAD", "id": 11 },
+    { "name": "HOST_ITEM", "id": 12 },
+    { "name": "HOST_END", "id": 13 },
+    { "name": "SELECT_HOST", "id": 14 },
+    { "name": "THREAD_ACTION", "id": 15 },
+    { "name": "PROJECT_NAME", "id": 16 },
+    { "name": "PROJECT_PREVIEW", "id": 17 },
+    { "name": "PROJECT_CREATE", "id": 18 },
+    { "name": "CONCIERGE", "id": 19 },
+    { "name": "SCREENSHOT_PAGE", "id": 90 }
+  ],
+
+  "scopes": [
+    { "name": "SCOPE_ACTIVE", "id": 0 },
+    { "name": "SCOPE_SETTLED", "id": 1 }
+  ]
+}

@@ -7,3 +7,6 @@ pebblecode/.lock-waf_*
 
 *.log
 *.tmp
+
+# Stray capture artifact from a Docker emulator run; the rig writes to dist/.
+pebblecode/shot.png
