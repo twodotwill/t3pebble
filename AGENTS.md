@@ -46,6 +46,8 @@ Requests in flight are one bitmask, `s_busy`, not five booleans, and every failu
 
 `refreshHosts()` skips sending a `CMD_HOST_ITEM` whose fields are unchanged since the last poll, so `CMD_HOST_END`'s `total` is authoritative for `s_host_count` and index 0 no longer resets the list. Any new suppression has to keep that pairing, and `lastHostRow` must be cleared whenever the watch might not be holding what the phone thinks it is (a failed send, a settings change).
 
+That suppression is what pays for `REFRESH_INTERVAL_MS` being 60 s rather than the 300 s it started at: the home screen exists to show a run count draining, and five minutes was too slow to watch one. A poll where nothing moved now costs a single `CMD_HOST_END`, so a quiet minute is cheaper on the radio than one busy five-minute poll used to be. The cost that did land is on the phone — one HTTP request per host per minute — so if this ever needs cutting, look there and at `HOST_PROBE_TIMEOUT_MS` (a sleeping laptop spends the full 8 s with the progress rail sweeping) before touching the interval.
+
 `ActionMenuDidCloseCb`'s second parameter is the performed `ActionMenuItem`, not the root level, despite the SDK's doc comment. Pass the level through `ActionMenuConfig.context` so `action_menu_hierarchy_destroy` has something to free.
 
 Multi-host setup goes through one pasteable line per machine, `t3pebble1|<label>|<base URL>|<token>`, printed by the launch script and parsed by `parseServerBundle()` in the bridge. The settings page embeds that function's own source via `String(parseServerBundle)` rather than reimplementing it, so the two cannot drift — keep it free of helper calls. Pasting a line for an already-configured base URL updates that entry's token instead of appending.

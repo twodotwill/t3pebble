@@ -3,7 +3,7 @@
   "shortName": "t3pebble",
   "longName": "T3 Pebble",
   "companyName": "Pebble",
-  "versionLabel": "0.7",
+  "versionLabel": "0.8",
   "sdkVersion": "3",
   "enableMultiJS": true,
   "targetPlatforms": [

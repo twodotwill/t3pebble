@@ -66,14 +66,20 @@
 #define SCOPE_ACTIVE  0
 #define SCOPE_SETTLED 1
 
-#define BUILD_LABEL "v0.7"
+#define BUILD_LABEL "v0.8"
 /* @generated protocol:end */
 
 #define MAX_HOSTS 6
 #define MAX_SESSIONS 20
 #define MAX_PROJECTS 20
 #define MAX_CONTEXT_TEXT 640
-#define REFRESH_INTERVAL_MS 300000
+/* Five minutes was too slow to watch a run count drain -- the thing the home
+   screen exists to show. One minute is affordable because refreshHosts() only
+   sends host rows that actually changed: a poll where nothing moved costs a
+   single CMD_HOST_END, so a quiet minute here is cheaper on the radio than one
+   busy five-minute poll used to be. The phone still makes one HTTP request per
+   host per minute, which is where the real cost of this landed. */
+#define REFRESH_INTERVAL_MS 60000
 /* A failed send used to leave no timer armed at all, so one Bluetooth blip
    stopped the app polling until a button was pressed. Recovery is worth more
    than the full interval, so a fault re-arms on a short retry instead. */
