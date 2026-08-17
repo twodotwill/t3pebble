@@ -22,16 +22,25 @@ t3 auth session issue --ttl 365d --label "T3 Pebble watch" --token-only
 
 That grants `AuthAdministrativeScopes`, which includes the two scopes the app needs: `orchestration:read` and `orchestration:operate`. The token must be issued against the same data directory the server runs with (`--base-dir`, or the default).
 
-Every request carries it as `Authorization: Bearer <token>`. There is no pairing exchange, no WebSocket ticket, and no session cookie involved.
+Every REST request carries it as `Authorization: Bearer <token>`. There is no
+pairing exchange or session cookie involved.
+
+For model discovery when starting a thread, the bridge posts
+the bearer token to `POST /api/auth/websocket-ticket`, then uses the returned
+short-lived ticket as `wsTicket` on `/ws`. The bearer token is never placed in
+the WebSocket URL.
 
 ### Reads
 
 | Route | Used for |
 | --- | --- |
-| `GET /api/orchestration/snapshot` | Projects and thread metadata |
+| `GET /api/orchestration/shell` | Projects and thread lifecycle: one request per host |
 | `GET /api/orchestration/threads/:threadId?turnLimit=N` | Thread bodies: messages, activities, session |
+| `POST /api/auth/websocket-ticket` + `server.getConfig` WebSocket RPC | Live provider/model catalog for the new-thread picker |
 
-The snapshot route serves the *command read model*: every thread arrives with `messages`, `activities`, and `checkpoints` empty, but with `session` and `latestTurn` populated. That is enough for a first paint of the list, and the app then hydrates each thread over the thread detail route.
+The shell route serves `OrchestrationShellSnapshot`, the same read model the T3 web sidebar classifies from: no message bodies, but `session`, `latestTurn` and every lifecycle field. That is what the watch's list, roll-up and detail card all classify from, so the two clients cannot disagree; the thread detail route only supplies bodies.
+
+`GET /api/orchestration/snapshot` also exists and returns the fuller command read model. The app does not use it — it is a bigger response and carries nothing the shell route does not.
 
 Turn windows requested by the app:
 
@@ -39,6 +48,31 @@ Turn windows requested by the app:
 - `turnLimit=40` for the transcript view
 
 The thread detail response is `{ snapshotSequence, thread, page }`.
+
+Provider snapshots are not present in either orchestration REST read model.
+For a new thread, the phone reads `server.getConfig`, puts the project's
+`defaultModelSelection` first, then lists live non-legacy models from enabled
+and installed providers. The config is cached for five minutes. If the phone
+runtime cannot open the WebSocket or the request fails, the menu contains only
+the project default already returned by the shell route, so thread creation is
+still available.
+
+### Thread lifecycle parity
+
+`threadState()` in the bridge is a port of T3's `effectiveSettled` / `effectiveSnoozed` (`packages/client-runtime/src/state/threadSettled.ts`) plus the bucket order the sidebar applies around them (`apps/web/src/components/Sidebar.tsx`): **snooze outranks a pin, a pin outranks settled**. Three things a thread can be blocked on all read as `needs`, matching the sidebar's status pills:
+
+| Shell field | T3 pill | Watch |
+| --- | --- | --- |
+| `hasPendingApprovals` | Pending Approval | `needs`, reply routed to `thread.approval.respond` |
+| `hasPendingUserInput` | Awaiting Input | `needs`, reply routed to `thread.user-input.respond` |
+| `interactionMode === "plan"` + `hasActionableProposedPlan` + settled latest turn | Plan Ready | `needs`, reply sent as a normal turn |
+
+`pinnedAt` suppresses the settled bucket entirely, including an explicit `settledOverride: "settled"` — the server's decider clears one on the other, so the two only ever coexist on a raced write.
+
+**Settled is derived, not stored.** The API carries only `settledOverride` and `settledAt`, and both are null on a thread that settled by inactivity — every client computes the rest from the same shell fields. So "the server says it is settled" is not a thing that can be asked; a client that classifies differently is a client missing one of the inputs. The watch is missing two:
+
+- **`sidebarAutoSettleAfterDays`.** A web client setting kept in `localStorage` and never sent to the server, so no route can carry it. It is entered by hand on the Pebble settings page instead (*Settle a quiet thread after*, days or blank for never, clamped to T3's 1–90) and defaults to T3's 3. Set it to whatever T3 is set to; leave them different and every thread quiet for longer than one window and less than the other reads settled on one client and idle on the other.
+- **Change-request state.** T3 auto-settles a thread whose PR merged (when `sidebarAutoSettleOnMerge` is on) or closed, and refuses to auto-settle one with an open PR. The state comes from live VCS status, delivered over the `vcsRefreshStatus` **WebSocket RPC** — there is no REST equivalent, so it is out of reach for a bridge that only speaks the two read routes above. Threads with a merged or closed PR therefore stay active on the watch until they age out on inactivity.
 
 ### Writes
 
@@ -83,8 +117,10 @@ Note that an invalid field inside the block still returns `400`, so the block
 being accepted proves nothing about it being acted on.
 
 So the bridge dispatches `thread.create` first and then `thread.turn.start`
-against that thread id, carrying no bootstrap. Thread ids do not have to be
-UUIDs; the bridge's own `pebble-thread-...` format is accepted.
+against that thread id, carrying no bootstrap. Both commands carry the model
+chosen on the watch; choosing the first row preserves the project's complete
+server-side default selection, including its option values. Thread ids do not
+have to be UUIDs; the bridge's own `pebble-thread-...` format is accepted.
 
 ### Error shapes
 
@@ -99,5 +135,5 @@ The bridge reads `reason` / `requiredScope` for its status line. Relevant status
 ## Notes
 
 - `access-control-allow-origin` is `*`, so the PebbleKit JS sandbox can call the API directly.
-- The WebSocket RPC endpoint still exists on mainline, but the app no longer uses it. Its read side is subscription-based (`orchestration.subscribeShell`, `orchestration.subscribeThread`), which is a poor fit for a watch that polls; the REST routes carry the same data in one request each.
+- The bridge uses one non-subscription WebSocket RPC, `server.getConfig`, only when the user opens the new-thread model picker. Thread polling remains on the REST routes; the subscription RPCs (`orchestration.subscribeShell`, `orchestration.subscribeThread`) are still a poor fit for a watch that polls.
 - `t3 serve` supports `--host`, `--port`, `--base-dir`, and `--no-browser`, which is all the launch script needs. Mainline also ships `--tailscale-serve` if you would rather it manage Tailscale itself.

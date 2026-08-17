@@ -41,6 +41,9 @@
 #define KEY_ACTION       29
 #define KEY_PATH         30
 #define KEY_NAME         31
+#define KEY_MODEL        32
+#define KEY_INSTANCE_ID  33
+#define KEY_IS_DEFAULT   34
 
 #define CMD_REFRESH         1
 #define CMD_SESSION_ITEM    2
@@ -61,17 +64,21 @@
 #define CMD_PROJECT_PREVIEW 17
 #define CMD_PROJECT_CREATE  18
 #define CMD_CONCIERGE       19
+#define CMD_MODEL_REQUEST   20
+#define CMD_MODEL_ITEM      21
+#define CMD_MODEL_END       22
 #define CMD_SCREENSHOT_PAGE 90
 
 #define SCOPE_ACTIVE  0
 #define SCOPE_SETTLED 1
 
-#define BUILD_LABEL "v0.8"
+#define BUILD_LABEL "v0.10"
 /* @generated protocol:end */
 
 #define MAX_HOSTS 6
 #define MAX_SESSIONS 20
 #define MAX_PROJECTS 20
+#define MAX_MODELS 24
 #define MAX_CONTEXT_TEXT 640
 /* Five minutes was too slow to watch a run count drain -- the thing the home
    screen exists to show. One minute is affordable because refreshHosts() only
@@ -134,7 +141,8 @@ typedef enum {
   BusyThreads = 1 << 1,
   BusyDetail  = 1 << 2,
   BusyContext = 1 << 3,
-  BusySending = 1 << 4
+  BusySending = 1 << 4,
+  BusyModels  = 1 << 5
 } BusyFlag;
 
 typedef struct {
@@ -169,6 +177,13 @@ typedef struct {
   char directory[40];
 } ProjectItem;
 
+typedef struct {
+  char label[56];
+  char instance_id[40];
+  char model[64];
+  bool is_default;
+} ModelItem;
+
 typedef enum {
   DictationTargetSession,
   DictationTargetProject,
@@ -191,7 +206,8 @@ typedef enum {
   ActionSettle,
   ActionUnsettle,
   ActionInterrupt,
-  ActionCreateProject
+  ActionCreateProject,
+  ActionModelBase = 100
 } ActionKind;
 
 /* Thread-list scope and paging state, all reported by the phone alongside a
@@ -226,7 +242,7 @@ static AppTimer *s_refresh_timer;
 static AppTimer *s_stream_timer;
 static DictationSession *s_dictation;
 static GFont s_font_dseg_big;
-static GFont s_font_dseg_small;
+static GFont s_font_dseg_mid;
 static GFont s_font_dot;
 static GFont s_font_dot_small;
 static GBitmap *s_hatch;
@@ -237,23 +253,36 @@ static DictationTarget s_dictation_target = DictationTargetSession;
    given font, and laying them out again inside every frame was the single
    most expensive thing the host screen did -- graphics_text_layout_get_content_size
    is a full layout pass, and draw_seg_value ran two of them per readout. */
-static GSize s_seg_small;      /* "88" in the small DSEG face */
-static GSize s_seg_big;        /* "88" in the big DSEG face */
-static int s_seg_small_digit;  /* one digit's advance, small */
-static int s_seg_big_digit;    /* one digit's advance, big */
+/* Two segment faces, both at sizes where DSEG7 rasterises on whole pixels.
+   The face is an outline, so it is only pixel-exact where its stems land on
+   the grid: at 34 and 64 every digit has one stem weight and no ink in a
+   one-pixel run, while the 20px face this replaced put 12.5% of its ink in
+   slivers and mixed 2px and 8px stems in the same glyph. tools/verify_dseg.py
+   is the check; change a size and run it before believing the result. */
+typedef enum {
+  SegMid = 0,   /* 34px: the sub-display readouts */
+  SegBig,       /* 64px: the power-on segment test */
+  SegSizeCount
+} SegSize;
+
+static GSize s_seg_block[SegSizeCount];  /* "88" in each DSEG face */
+static int s_seg_digit[SegSizeCount];    /* one digit's advance, per face */
 static GSize s_seg_self_test;  /* "88:88", the power-on screen's all-segments test */
 
 static HostItem s_hosts[MAX_HOSTS];
 static SessionItem s_sessions[MAX_SESSIONS];
 static ProjectItem s_projects[MAX_PROJECTS];
+static ModelItem s_models[MAX_MODELS];
 
 static int s_host_count;
 static int s_session_count;
 static int s_project_count;
+static int s_model_count;
 static int s_host_cursor;
 static int s_selected_host_index = -1;
 static int s_selected_index = -1;
 static int s_selected_project_index = -1;
+static int s_selected_model_index = -1;
 static int s_context_page;
 static int s_context_page_count = 1;
 static int s_pending_context_page;
@@ -303,6 +332,8 @@ static void request_detail(int index, bool full_context);
 static void request_context_page(int page);
 static void send_prompt_text(const char *text);
 static void send_new_thread_text(const char *text);
+static void request_project_models(void);
+static void open_model_menu(void);
 static void start_dictation(void);
 static void schedule_refresh(uint32_t delay_ms);
 static void update_stream_timer(void);
@@ -714,7 +745,6 @@ static void enter_error_state(const char *text) {
   log_error(text);
   set_status(text);
   update_detail_text();
-  mark_all_dirty();
   update_stream_timer();
   schedule_refresh(RETRY_INTERVAL_MS);
 }
@@ -876,21 +906,31 @@ static GSize seg_text_size(const char *text, GFont font) {
    the draw call -- two full text-layout passes per readout, four readouts on
    the host screen, on every frame of a 9 Hz loop. Measured once at launch
    instead; a digit's advance is all that is needed to right-align the value. */
+static GFont seg_font(SegSize size) {
+  return size == SegBig ? s_font_dseg_big : s_font_dseg_mid;
+}
+
 static void lcd_metrics_measure(void) {
-  s_seg_small = s_font_dseg_small ? seg_text_size("88", s_font_dseg_small) : GSize(22, 18);
-  s_seg_big = s_font_dseg_big ? seg_text_size("88", s_font_dseg_big) : GSize(44, 30);
-  s_seg_small_digit = s_font_dseg_small ? seg_text_size("8", s_font_dseg_small).w
-                                        : s_seg_small.w / 2;
-  s_seg_big_digit = s_font_dseg_big ? seg_text_size("8", s_font_dseg_big).w : s_seg_big.w / 2;
-  s_seg_self_test = s_font_dseg_big ? seg_text_size("88:88", s_font_dseg_big) : GSize(110, 30);
+  GFont mid = seg_font(SegMid), big = seg_font(SegBig);
+  s_seg_block[SegMid] = mid ? seg_text_size("88", mid) : GSize(56, 34);
+  s_seg_block[SegBig] = big ? seg_text_size("88", big) : GSize(104, 64);
+  s_seg_digit[SegMid] = mid ? seg_text_size("8", mid).w : s_seg_block[SegMid].w / 2;
+  s_seg_digit[SegBig] = big ? seg_text_size("8", big).w : s_seg_block[SegBig].w / 2;
+  s_seg_self_test = big ? seg_text_size("88:88", big) : GSize(110, 64);
 }
 
-static GSize seg_block_size(bool big) {
-  return big ? s_seg_big : s_seg_small;
+static GSize seg_block_size(SegSize size) {
+  return s_seg_block[size];
 }
 
-static void draw_seg_value(GContext *ctx, GPoint at, int value, GColor on, bool big) {
-  GFont font = big ? s_font_dseg_big : s_font_dseg_small;
+/* The ghost is what makes it read as a panel rather than as text: a real LCD
+   shows its unlit segments, so every readout is drawn as "88" in the ghost
+   tone with the live value lit on top of it. `ghost` is a parameter because an
+   inverted band runs the same readout on ink instead of on glass, where the
+   pale ghost would be the brightest thing on the screen. */
+static void draw_seg_value_ex(GContext *ctx, GPoint at, int value, GColor on, SegSize size,
+                              GColor ghost, bool hatched) {
+  GFont font = seg_font(size);
   char live[8];
   snprintf(live, sizeof(live), "%d", value);
 
@@ -898,19 +938,21 @@ static void draw_seg_value(GContext *ctx, GPoint at, int value, GColor on, bool 
     /* A resource that failed to load must not leave a hole where the reading
        goes: fall back to the label face rather than drawing nothing. */
     graphics_context_set_text_color(ctx, on);
-    graphics_draw_text(ctx, live, big ? font_row_title() : font_row_detail(),
-                       GRect(at.x, at.y, 44, big ? 30 : 18),
+    graphics_draw_text(ctx, live, size == SegBig ? font_row_title() : font_row_detail(),
+                       GRect(at.x, at.y, 44, size == SegBig ? 30 : 18),
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     return;
   }
 
-  GSize full = seg_block_size(big);
-  int live_w = (int)strlen(live) * (big ? s_seg_big_digit : s_seg_small_digit);
+  GSize full = seg_block_size(size);
+  int live_w = (int)strlen(live) * s_seg_digit[size];
 
-  graphics_context_set_text_color(ctx, lcd_ghost_tone());
+  graphics_context_set_text_color(ctx, ghost);
   graphics_draw_text(ctx, "88", font, GRect(at.x, at.y, full.w + 4, full.h + 4),
                      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-  hatch_rect(ctx, GRect(at.x, at.y, full.w + 2, full.h + 2));
+  if (hatched) {
+    hatch_rect(ctx, GRect(at.x, at.y, full.w + 2, full.h + 2));
+  }
 
   /* Right-aligned into the ghost so the ones column never moves. */
   graphics_context_set_text_color(ctx, on);
@@ -918,6 +960,7 @@ static void draw_seg_value(GContext *ctx, GPoint at, int value, GColor on, bool 
                      GRect(at.x + full.w - live_w, at.y, live_w + 4, full.h + 4),
                      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 }
+
 
 /* A BAT-style segmented meter. The reference spends this on battery; here it
    carries how much of the list is behind you, so the band stays useful. */
@@ -1101,13 +1144,6 @@ static const char *state_word(const char *state) {
   return "NO THREADS";
 }
 
-static int state_headline_count(const HostItem *host) {
-  if (state_is(host->state, "needs")) return host->needs;
-  if (state_is(host->state, "run")) return host->run;
-  if (state_is(host->state, "idle")) return host->idle;
-  if (state_is(host->state, "settled")) return host->settled;
-  return 0;
-}
 
 /* A square block, not a dot: the reference marks its day strip and battery in
    squares, and shape (filled / hollow / struck) carries the state on the
@@ -1237,6 +1273,61 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
                                  panel.origin.y + panel.size.h - 17), lcd_ink());
 }
 
+/* One channel of the home screen, drawn as a Casio sub-display: a boxed field
+   holding a segment readout, the state it counts, and a bar for that state's
+   share of the machine. Three stacked is the whole screen.
+
+   They are deliberately the same size. Which state matters is a property of
+   the machine right now, not of the layout, so the band that can be acted on
+   earns attention by inverting -- the way a lit mode marker does on the
+   reference -- rather than by being drawn bigger than its neighbours. */
+static void draw_state_band(GContext *ctx, GRect band, const char *state, const char *label,
+                            int count, int total) {
+  bool alert = count > 0 && state_is(state, "needs");
+  GColor ink = alert ? lcd_glass() : (count > 0 ? state_color(state) : lcd_dim());
+  GColor unlit = alert ? lcd_dim() : lcd_ghost_tone();
+
+  if (alert) {
+    graphics_context_set_fill_color(ctx, lcd_ink());
+    graphics_fill_rect(ctx, band, 3, GCornersAll);
+  } else {
+    draw_field_box(ctx, band);
+  }
+
+  GSize block = seg_block_size(SegMid);
+  int pad = 5;
+  int seg_x = band.origin.x + pad;
+  draw_seg_value_ex(ctx, GPoint(seg_x, band.origin.y + (band.size.h - block.h) / 2),
+                    clamp_int(count, 0, 99), ink, SegMid, unlit, !alert);
+
+  int text_x = seg_x + block.w + 8;
+  int text_w = band.origin.x + band.size.w - pad - text_x;
+
+  /* The count against the machine total, so a band reads without arithmetic. */
+  char share[16];
+  snprintf(share, sizeof(share), "%d/%d", clamp_int(count, 0, 99), clamp_int(total, 0, 999));
+  int share_w = tracked_width(share, font_legend());
+  graphics_context_set_text_color(ctx, ink);
+  draw_tracked(ctx, share, font_legend(),
+               GPoint(band.origin.x + band.size.w - pad - share_w, band.origin.y + 7));
+  draw_tracked_max(ctx, label, font_legend(), GPoint(text_x, band.origin.y + 7),
+                   text_w - share_w - 6);
+
+  /* Unlit cells are drawn in the ghost tone rather than left blank: a real
+     panel shows the whole scale and lights part of it. All three bars share
+     the machine total, so read together they are how loaded it is. */
+  int cell = 5, step = 7;
+  int cells = text_w / step;
+  int lit = total > 0 ? (count * cells) / total : 0;
+  if (lit < 1 && count > 0) {
+    lit = 1;
+  }
+  for (int i = 0; i < cells; i++) {
+    graphics_context_set_fill_color(ctx, i < lit ? ink : unlit);
+    graphics_fill_rect(ctx, GRect(text_x + i * step, band.origin.y + 24, cell, 7), 0, GCornerNone);
+  }
+}
+
 static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   s_frame_count++;
   GRect bounds = layer_get_bounds(layer);
@@ -1318,61 +1409,35 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
     return;
   }
 
-  /* Field one: the machine, with its size underneath. The reference stacks a
-     caption under every field rather than letting a value stand alone. */
+  /* The machine, with what it holds underneath. Settled sits here rather than
+     in the bands below: it is history, and the bands are for the three states
+     you would actually do something about. */
   graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, host->title, font_row_title(),
                      GRect(inner_x, panel.origin.y + 2, inner_w, 20),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-  char sub[28];
-  snprintf(sub, sizeof(sub), "%d THREAD%s", total, total == 1 ? "" : "S");
+  char sub[36];
+  snprintf(sub, sizeof(sub), "%d THREAD%s   %d SETTLED", total, total == 1 ? "" : "S",
+           clamp_int(host->settled, 0, 999));
   draw_caption(ctx, sub, GPoint(inner_x, panel.origin.y + 19), lcd_ink());
 
-  /* Field two: the boxed complication, on its own full-width row. It was laid
-     out on a guessed pitch before, which overlapped the digits and spilled them
-     out of the box; the pitch is now measured from the font, which is the only
-     thing that can be right across three screen sizes. */
-  GSize seg2 = seg_block_size(false);
-  int cap_w = 11;
-  int cell_w = cap_w + seg2.w;
-  int slack = inner_w - 3 * cell_w;
-  int gap = slack > 0 ? slack / 4 : 2;
-  GRect field = GRect(inner_x, panel.origin.y + 33, inner_w, seg2.h + 6);
-  draw_field_box(ctx, field);
+  graphics_context_set_fill_color(ctx, lcd_dim());
+  graphics_fill_rect(ctx, GRect(inner_x, panel.origin.y + 36, inner_w, 1), 0, GCornerNone);
 
-  int trio[3] = { host->run, host->idle, host->settled };
-  const char *trio_caps[3] = { "R", "I", "S" };
+  /* Three channels filling the glass. The screen this replaced spent its one
+     big readout on whichever state happened to be the headline and squeezed
+     the rest into a strip of 18px digits, which left 43 rows of the panel --
+     roughly a quarter of it -- empty above the indicator row. */
+  int bands_top = panel.origin.y + 40;
+  int bands_bottom = strip_y - 7;
+  int band_gap = 3;
+  int band_h = (bands_bottom - bands_top - 2 * band_gap) / 3;
+  const char *band_state[3] = { "needs", "run", "idle" };
+  const char *band_label[3] = { "NEEDS YOU", "RUNNING", "IDLE" };
+  int band_count[3] = { host->needs, host->run, host->idle };
   for (int i = 0; i < 3; i++) {
-    int cell_x = field.origin.x + gap + i * (cell_w + gap);
-    draw_caption(ctx, trio_caps[i], GPoint(cell_x, field.origin.y + 2), lcd_ink());
-    draw_seg_value(ctx, GPoint(cell_x + cap_w, field.origin.y + 3),
-                   clamp_int(trio[i], 0, 99), lcd_ink(), false);
-  }
-
-  /* Field three: the headline. One big segment readout, the way the time
-     dominates the reference, with two caption lines beside it. */
-  int big_y = field.origin.y + field.size.h + 6;
-  GColor ink = state_color(host->state);
-  if (gcolor_equal(ink, lcd_dim())) {
-    ink = lcd_ink();
-  }
-  draw_seg_value(ctx, GPoint(inner_x, big_y), clamp_int(state_headline_count(host), 0, 99), ink, true);
-
-  GSize big_block = seg_block_size(true);
-  int label_x = inner_x + big_block.w + 10;
-  graphics_context_set_text_color(ctx, lcd_ink());
-  draw_tracked(ctx, state_word(host->state), font_legend(), GPoint(label_x, big_y + 2));
-  char of_line[24];
-  snprintf(of_line, sizeof(of_line), "OF %d", total);
-  draw_caption(ctx, of_line, GPoint(label_x, big_y + 17), lcd_ink());
-  draw_caption(ctx, "TAP OPEN", GPoint(label_x, big_y + 30), lcd_ink());
-
-  /* Static. Colour and the filled shape already say "running"; making it
-     breathe would mean a timer that never stops on the screen most likely to
-     be left open. */
-  if (state_is_live(host->state) || state_is(host->state, "needs")) {
-    draw_state_mark(ctx, GRect(panel.origin.x + panel.size.w - 15, big_y + 4, 7, 7),
-                    host->state, false, false);
+    draw_state_band(ctx, GRect(inner_x, bands_top + i * (band_h + band_gap), inner_w, band_h),
+                    band_state[i], band_label[i], band_count[i], total);
   }
 
   /* The indicator row: hairline, meter with its caption, sync age, and the
@@ -1454,8 +1519,7 @@ static void request_host_threads(int scope, int offset) {
 
   DictionaryIterator *iter = NULL;
   if (app_message_outbox_begin(&iter) != APP_MSG_OK || !iter) {
-    log_error("Phone link busy");
-    set_status("Phone link busy");
+    enter_error_state("Phone link busy");
     return;
   }
   int command = CMD_SELECT_HOST;
@@ -1829,6 +1893,9 @@ static void thread_select_long(MenuLayer *menu_layer, MenuIndex *cell_index, voi
 
 static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
   if (cell_index->section == 1) {
+    if (busy_is(BusyModels)) {
+      return;
+    }
     if (cell_index->row == s_project_count) {
       s_dictation_target = DictationTargetNewProject;
       set_status("Name the project");
@@ -1839,9 +1906,8 @@ static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *da
       return;
     }
     s_selected_project_index = cell_index->row;
-    s_dictation_target = DictationTargetProject;
-    set_status("Dictate prompt");
-    start_dictation();
+    s_selected_model_index = -1;
+    request_project_models();
     return;
   }
 
@@ -1883,8 +1949,10 @@ static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *da
 
 static void send_command_begin(DictionaryIterator **iter, int command) {
   if (app_message_outbox_begin(iter) != APP_MSG_OK || !*iter) {
-    log_error("Phone link busy");
-    set_status("Phone link busy");
+    /* Startup still has s_hosts_synced=false and detail requests set their
+       busy bit before opening the outbox. Returning here used to leave the
+       110ms animation timer running forever with no reply possible. */
+    enter_error_state("Phone link busy");
     return;
   }
   dict_write_int(*iter, KEY_CMD, &command, sizeof(command), true);
@@ -1892,6 +1960,15 @@ static void send_command_begin(DictionaryIterator **iter, int command) {
 
 static void request_refresh(void) {
   if (busy_is(BusyHosts)) {
+    return;
+  }
+  /* The host counts are drawn on the home screen and nowhere else. Polling
+     while the user is reading a transcript costs the phone one HTTP request
+     per host per minute for numbers nobody can see, so the poll is deferred
+     until that screen is back on top -- host_window_appear catches up if the
+     wait ran past an interval. */
+  if (!host_window_visible()) {
+    schedule_refresh(REFRESH_INTERVAL_MS);
     return;
   }
   DictionaryIterator *iter = NULL;
@@ -2006,6 +2083,24 @@ static void send_concierge_text(const char *text) {
   app_message_outbox_send();
 }
 
+static void request_project_models(void) {
+  if (s_selected_project_index < 0 || s_selected_project_index >= s_project_count) {
+    return;
+  }
+  DictionaryIterator *iter = NULL;
+  send_command_begin(&iter, CMD_MODEL_REQUEST);
+  if (!iter) {
+    return;
+  }
+  dict_write_cstring(iter, KEY_PROJECT_ID, s_projects[s_selected_project_index].id);
+  s_model_count = 0;
+  busy_set(BusyModels);
+  set_status("Loading models");
+  update_stream_timer();
+  s_message_out++;
+  app_message_outbox_send();
+}
+
 /* The second parameter is the performed item, not the root level, whatever the
    SDK's doc comment says, so the level to free is carried in the context. */
 static void action_menu_closed(ActionMenu *menu, const ActionMenuItem *performed, void *context) {
@@ -2013,7 +2108,18 @@ static void action_menu_closed(ActionMenu *menu, const ActionMenuItem *performed
 }
 
 static void perform_action(ActionMenu *menu, const ActionMenuItem *action, void *context) {
-  switch ((ActionKind)(uintptr_t)action_menu_item_get_action_data(action)) {
+  uintptr_t kind = (uintptr_t)action_menu_item_get_action_data(action);
+  if (kind >= ActionModelBase && kind < ActionModelBase + MAX_MODELS) {
+    int index = (int)(kind - ActionModelBase);
+    if (index < s_model_count) {
+      s_selected_model_index = index;
+      s_dictation_target = DictationTargetProject;
+      set_status("Dictate prompt");
+      start_dictation();
+    }
+    return;
+  }
+  switch ((ActionKind)kind) {
     case ActionReply:
       s_dictation_target = DictationTargetSession;
       start_dictation();
@@ -2033,6 +2139,10 @@ static void perform_action(ActionMenu *menu, const ActionMenuItem *action, void 
     case ActionCreateProject:
       set_status("Creating project");
       send_project_create();
+      return;
+    case ActionModelBase:
+      /* Model actions are the ActionModelBase+i range handled above. Keeping
+         the sentinel here makes the enum switch exhaustive under GCC 14. */
       return;
   }
 }
@@ -2078,6 +2188,26 @@ static void open_project_confirm(void) {
     return;
   }
   action_menu_level_add_action(level, "Create", perform_action, (void *)(uintptr_t)ActionCreateProject);
+  open_action_menu(level);
+}
+
+/* The server default is item zero and therefore focused when the menu opens.
+   Labels include the provider for alternatives, while the exact instance id
+   and model slug stay in s_models for the command sent after dictation. */
+static void open_model_menu(void) {
+  if (s_model_count <= 0) {
+    enter_error_state("No models available");
+    return;
+  }
+  ActionMenuLevel *level = action_menu_level_create(s_model_count);
+  if (!level) {
+    enter_error_state("Out of memory");
+    return;
+  }
+  for (int i = 0; i < s_model_count; i++) {
+    action_menu_level_add_action(level, s_models[i].label, perform_action,
+                                 (void *)(uintptr_t)(ActionModelBase + i));
+  }
   open_action_menu(level);
 }
 
@@ -2139,7 +2269,9 @@ static void send_prompt_text(const char *text) {
 }
 
 static void send_new_thread_text(const char *text) {
-  if (s_selected_project_index < 0 || s_selected_project_index >= s_project_count || !text || !text[0]) {
+  if (s_selected_project_index < 0 || s_selected_project_index >= s_project_count ||
+      s_selected_model_index < 0 || s_selected_model_index >= s_model_count ||
+      !text || !text[0]) {
     return;
   }
   DictionaryIterator *iter = NULL;
@@ -2150,6 +2282,8 @@ static void send_new_thread_text(const char *text) {
   dict_write_int(iter, KEY_INDEX, &s_selected_project_index, sizeof(s_selected_project_index), true);
   dict_write_cstring(iter, KEY_PROJECT_ID, s_projects[s_selected_project_index].id);
   dict_write_cstring(iter, KEY_PROMPT, text);
+  dict_write_cstring(iter, KEY_INSTANCE_ID, s_models[s_selected_model_index].instance_id);
+  dict_write_cstring(iter, KEY_MODEL, s_models[s_selected_model_index].model);
   busy_set(BusySending);
   set_status("Starting");
   update_stream_timer();
@@ -2732,6 +2866,31 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       reset_projects();
     }
     mark_all_dirty();
+  } else if (command == CMD_MODEL_ITEM) {
+    int index = int_tuple(iter, KEY_INDEX, -1);
+    if (index == 0) {
+      memset(s_models, 0, sizeof(s_models));
+      s_model_count = 0;
+    }
+    if (index >= 0 && index < MAX_MODELS) {
+      ModelItem *model = &s_models[index];
+      copy_tuple(model->label, sizeof(model->label), iter, KEY_TITLE);
+      copy_tuple(model->instance_id, sizeof(model->instance_id), iter, KEY_INSTANCE_ID);
+      copy_tuple(model->model, sizeof(model->model), iter, KEY_MODEL);
+      model->is_default = int_tuple(iter, KEY_IS_DEFAULT, 0) != 0;
+      if (index + 1 > s_model_count) {
+        s_model_count = index + 1;
+      }
+    }
+  } else if (command == CMD_MODEL_END) {
+    s_model_count = clamp_int(int_tuple(iter, KEY_TOTAL, s_model_count), 0, MAX_MODELS);
+    busy_clear(BusyModels);
+    s_selected_model_index = -1;
+    set_status("Choose model");
+    update_stream_timer();
+    if (window_stack_get_top_window() == s_thread_window) {
+      open_model_menu();
+    }
   } else if (command == CMD_DETAIL) {
     /* Route by thread id, not by the index the phone echoes back. The list can
        be re-fetched while a detail request is in flight, and trusting the
@@ -2850,6 +3009,20 @@ static void host_window_load(Window *window) {
   update_host_rail();
 
   window_set_click_config_provider(window, host_click_config);
+}
+
+/* Coming back from a thread list or a transcript, where the poll was being
+   deferred. The counts on the glass are as old as the last time this screen
+   was up, so catch up immediately rather than waiting out the timer that was
+   quietly rescheduling itself the whole time. */
+static void host_window_appear(Window *window) {
+  if (!s_hosts_synced) {
+    return;
+  }
+  int age_ms = (int)(time(NULL) - s_last_sync) * 1000;
+  if (s_last_sync == 0 || age_ms >= (int)REFRESH_INTERVAL_MS) {
+    request_refresh();
+  }
 }
 
 static void host_window_unload(Window *window) {
@@ -2978,7 +3151,7 @@ static void init(void) {
   s_font_dot = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_20));
   s_font_dot_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_10));
   s_font_dseg_big = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_64));
-  s_font_dseg_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_20));
+  s_font_dseg_mid = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_34));
   lcd_tiles_create();
   /* Before any window loads: the panel's field geometry is derived from
      these, and host_window_load reads it. */
@@ -2992,6 +3165,7 @@ static void init(void) {
   s_host_window = window_create();
   window_set_window_handlers(s_host_window, (WindowHandlers) {
     .load = host_window_load,
+    .appear = host_window_appear,
     .unload = host_window_unload
   });
 
@@ -3053,7 +3227,7 @@ static void deinit(void) {
   if (s_font_dot) fonts_unload_custom_font(s_font_dot);
   if (s_font_dot_small) fonts_unload_custom_font(s_font_dot_small);
   if (s_font_dseg_big) fonts_unload_custom_font(s_font_dseg_big);
-  if (s_font_dseg_small) fonts_unload_custom_font(s_font_dseg_small);
+  if (s_font_dseg_mid) fonts_unload_custom_font(s_font_dseg_mid);
 }
 
 int main(void) {

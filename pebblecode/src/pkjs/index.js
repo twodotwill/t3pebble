@@ -43,6 +43,9 @@ var KEY_SETTLED = "settled";
 var KEY_ACTION = "action";
 var KEY_PATH = "path";
 var KEY_NAME = "name";
+var KEY_MODEL = "model";
+var KEY_INSTANCE_ID = "instance_id";
+var KEY_IS_DEFAULT = "is_default";
 
 var CMD_REFRESH = 1;
 var CMD_SESSION_ITEM = 2;
@@ -63,12 +66,15 @@ var CMD_PROJECT_NAME = 16;
 var CMD_PROJECT_PREVIEW = 17;
 var CMD_PROJECT_CREATE = 18;
 var CMD_CONCIERGE = 19;
+var CMD_MODEL_REQUEST = 20;
+var CMD_MODEL_ITEM = 21;
+var CMD_MODEL_END = 22;
 var CMD_SCREENSHOT_PAGE = 90;
 
 var SCOPE_ACTIVE = 0;
 var SCOPE_SETTLED = 1;
 
-var BUILD_LABEL = "v0.8";
+var BUILD_LABEL = "v0.10";
 // @generated protocol:end
 
 var MAX_SESSIONS = 20;
@@ -76,9 +82,13 @@ var SUMMARY_LIMIT = 150;
 var CONTEXT_LIMIT = 480;
 var CONTEXT_MESSAGE_LIMIT = 60;
 var DETAIL_MESSAGE_LIMIT = 10;
-// Kept equal to MAX_SERVERS so the host list is always one batch. Laptops sleep,
-// and a sleeping host costs a full timeout; batching would make hosts wait
-// behind that instead of alongside it.
+// Kept equal to MAX_SERVERS so the host list is always one batch, for two
+// reasons. Laptops sleep, and a sleeping host costs a full timeout; batching
+// would make the others wait behind that instead of alongside it. And on a
+// phone the radio is the expensive part: it stays in a high-power state for
+// seconds after a transfer, so six requests fired together cost one of those
+// tails a minute rather than six staggered ones. Lowering this to be "gentler"
+// would use more battery, not less.
 var SERVER_CONCURRENCY = 6;
 var MAX_APP_MESSAGE_FAILURES = 8;
 var DEFAULT_BASE_URL = "";
@@ -100,23 +110,33 @@ var ID_SEPARATOR = "::";
 // `orchestration.getSnapshot` RPC. The snapshot route is cheap but returns
 // threads with empty bodies, so thread detail is fetched per thread.
 // The shell route carries hasPendingApprovals / hasPendingUserInput /
-// settledOverride / latestUserMessageAt, which is everything the settled
-// classification needs. One request per host, no per-thread hydration.
+// hasActionableProposedPlan / settledOverride / pinnedAt / latestUserMessageAt,
+// which is everything the settled classification needs. One request per host,
+// no per-thread hydration.
 var T3_SHELL_PATH = "/api/orchestration/shell";
 var T3_THREAD_PATH = "/api/orchestration/threads/";
 var T3_DISPATCH_PATH = "/api/orchestration/dispatch";
-var T3_SOURCE_LABEL = "t3 http";
+var T3_WEBSOCKET_TICKET_PATH = "/api/auth/websocket-ticket";
 // Turn windows requested when hydrating thread bodies. The list only needs
 // enough turns to recover a status badge and a summary line; the transcript
 // view asks for a much deeper window.
 var LIST_TURN_LIMIT = 6;
 var CONTEXT_TURN_LIMIT = 40;
+// A watch menu should contain the current choices, not every historical model
+// a provider still advertises. The server default is always first; the rest
+// are the live, non-legacy models from enabled providers.
+var MAX_MODEL_CHOICES = 24;
+var MODEL_CONFIG_CACHE_MS = 5 * 60 * 1000;
+var MODEL_CONFIG_TIMEOUT_MS = 12000;
 // New threads inherit whatever the project's default is on the server. This
 // is only used when a project carries no default at all.
 var FALLBACK_MODEL_SELECTION = { instanceId: "codex", model: "gpt-5.6-sol" };
 var DEFAULT_SETTINGS = {
   servers: [],
-  nextServerId: 1
+  nextServerId: 1,
+  // Days of quiet before a thread settles on its own, matching T3's own
+  // setting. null means never, which is what T3 does when the option is off.
+  autoSettleAfterDays: 3
 };
 // The screenshot storyboard below is phone-side only and unreachable on a
 // handset (there is no `process`), so it costs bundle size and nothing else.
@@ -130,25 +150,53 @@ var appMessageQueue = [];
 var appMessageBusy = false;
 var appMessageFailureCount = 0;
 var pendingBySession = {};
-var cachedSessions = {};
 var lastSnapshot = null;
 var shellByServer = {};
+var modelConfigByServer = {};
 // What was last sent for each host, so an unchanged roll-up costs no radio
 // time. A quiet tailnet used to spend one acknowledged AppMessage per host
 // every five minutes restating numbers the watch already had.
 var lastHostRow = {};
+// Faults need the same treatment as rows. The watch deduplicates its visible
+// log, but sending the same offline sentence every minute still wakes both
+// radios and makes the watch parse and redraw an error it already holds.
+var lastHostFault = {};
+var lastGlobalHostFault = "";
+
+// `ready` and the watch's startup refresh can arrive together. A slow host can
+// keep the first probe open for seconds; a second identical set of XHRs cannot
+// make that answer fresher. A settings save may queue one follow-up because it
+// can change the server set underneath an in-flight poll.
+var hostRefreshInFlight = false;
+var hostRefreshAfterCurrent = false;
+
+// Parsing and normalising the server list is not free, and serverById() calls
+// it, and tagSnapshot() calls that, so a single poll used to re-parse the same
+// unchanged JSON once per host. The cache is keyed on the stored string rather
+// than simply held, so a write from anywhere -- the settings page, a test --
+// still invalidates it. Callers must treat the result as read-only.
+var settingsCacheRaw = null;
+var settingsCacheValue = null;
 
 function settings() {
   migrateSettings();
   var raw = localStorage.getItem("t3pebble_settings");
+  if (settingsCacheValue !== null && raw === settingsCacheRaw) {
+    return settingsCacheValue;
+  }
+  var value;
   if (!raw) {
-    return copySettings(DEFAULT_SETTINGS);
+    value = copySettings(DEFAULT_SETTINGS);
+  } else {
+    try {
+      value = normalizeSettings(JSON.parse(raw));
+    } catch (e) {
+      value = copySettings(DEFAULT_SETTINGS);
+    }
   }
-  try {
-    return normalizeSettings(JSON.parse(raw));
-  } catch (e) {
-    return copySettings(DEFAULT_SETTINGS);
-  }
+  settingsCacheRaw = raw;
+  settingsCacheValue = value;
+  return value;
 }
 
 function normalizeSettings(parsed) {
@@ -183,7 +231,30 @@ function normalizeSettings(parsed) {
       nextId = used + 1;
     }
   }
-  return { servers: servers, nextServerId: nextId };
+  var window = normalizeAutoSettleDays(parsed && parsed.autoSettleAfterDays);
+  autoSettleAfterDays = window;
+  return { servers: servers, nextServerId: nextId, autoSettleAfterDays: window };
+}
+
+// T3 accepts 1 to 90 days or the option turned off; anything else is settings
+// that were never written by this page, so it falls back to T3's default
+// rather than to "never" -- a bad value must not silently stop the watch from
+// ever settling anything.
+function normalizeAutoSettleDays(value) {
+  if (value === null) {
+    return null;
+  }
+  var days = parseInt(value, 10);
+  if (isNaN(days)) {
+    return DEFAULT_AUTO_SETTLE_AFTER_DAYS;
+  }
+  if (days < MIN_AUTO_SETTLE_AFTER_DAYS) {
+    return MIN_AUTO_SETTLE_AFTER_DAYS;
+  }
+  if (days > MAX_AUTO_SETTLE_AFTER_DAYS) {
+    return MAX_AUTO_SETTLE_AFTER_DAYS;
+  }
+  return days;
 }
 
 function normalizeServer(server) {
@@ -248,7 +319,8 @@ function saveSettings(next) {
   }
   var normalized = normalizeSettings({
     servers: (next && next.servers) || [],
-    nextServerId: previous
+    nextServerId: previous,
+    autoSettleAfterDays: next ? next.autoSettleAfterDays : undefined
   });
   localStorage.setItem("t3pebble_settings", JSON.stringify(normalized));
 }
@@ -619,6 +691,97 @@ function httpFailureMessage(status, responseText, server) {
   return serverAddress(server) + " failed with " + status + (detail ? " " + detail : "");
 }
 
+function webSocketUrl(server, ticket) {
+  return normalizeBaseUrl(server && server.baseUrl)
+    .replace(/^http:/i, "ws:")
+    .replace(/^https:/i, "wss:") +
+    "/ws?wsTicket=" + encodeURIComponent(ticket);
+}
+
+// Provider/model snapshots are not part of T3's orchestration REST read
+// model. Stock T3 exposes them through server.getConfig, so mint a short-lived
+// ticket with the same bearer token and make that one read-only RPC.
+function fetchServerConfig(server, callback) {
+  var cached = modelConfigByServer[server.id];
+  if (cached && Date.now() - cached.loadedAt < MODEL_CONFIG_CACHE_MS) {
+    callback(null, cached.value);
+    return;
+  }
+  if (typeof WebSocket === "undefined") {
+    callback(new Error("Phone WebSocket unavailable"));
+    return;
+  }
+  httpRequest(server, "POST", T3_WEBSOCKET_TICKET_PATH, null, function(ticketError, issued) {
+    if (ticketError || !issued || !issued.ticket) {
+      callback(ticketError || new Error("T3 did not issue a WebSocket ticket"));
+      return;
+    }
+    var done = false;
+    var socket;
+    var timer;
+
+    function finish(error, value) {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch (e) {
+        void e;
+      }
+      if (!error && value) {
+        modelConfigByServer[server.id] = { loadedAt: Date.now(), value: value };
+      }
+      callback(error, value);
+    }
+
+    try {
+      socket = new WebSocket(webSocketUrl(server, issued.ticket));
+      timer = setTimeout(function() {
+        finish(new Error("T3 model list timed out"));
+      }, MODEL_CONFIG_TIMEOUT_MS);
+      socket.onopen = function() {
+        socket.send(JSON.stringify({
+          _tag: "Request",
+          id: 1,
+          tag: "server.getConfig",
+          payload: {},
+          headers: []
+        }));
+      };
+      socket.onmessage = function(event) {
+        var response;
+        try {
+          response = JSON.parse(event.data);
+        } catch (e) {
+          finish(new Error("T3 sent an unreadable model list"));
+          return;
+        }
+        if (response && response._tag === "Exit" && response.requestId === 1) {
+          var exit = response.exit || {};
+          if (exit._tag === "Success" && exit.value) {
+            finish(null, exit.value);
+          } else {
+            finish(new Error("T3 rejected the model list request"));
+          }
+        }
+      };
+      socket.onerror = function() {
+        finish(new Error("Could not load T3 models"));
+      };
+      socket.onclose = function() {
+        if (!done) {
+          finish(new Error("T3 closed the model list request"));
+        }
+      };
+    } catch (e) {
+      finish(e);
+    }
+  });
+}
+
 // Fans out across every configured server and folds the replies into one
 // snapshot shaped exactly like the single-server one, with ids namespaced by
 // server. Everything downstream stays server-agnostic.
@@ -654,6 +817,27 @@ function tagThread(server, label, thread) {
 }
 
 
+
+// The shell reply is cached raw and only rewritten into namespaced ids when a
+// screen actually asks that host for its threads. Tagging deep-copies every
+// thread and every project, and the home screen -- the thing that polls every
+// minute -- needs none of it: threadState() and the roll-up read the raw
+// records perfectly well. Six hosts of twenty threads was 120 object copies a
+// minute, thrown away untouched.
+function cacheShell(server, snapshot) {
+  shellByServer[server.id] = { server: server, raw: snapshot || {}, tagged: null };
+  return shellByServer[server.id];
+}
+
+function taggedShell(entry) {
+  if (!entry) {
+    return null;
+  }
+  if (!entry.tagged) {
+    entry.tagged = tagSnapshot(entry.server, entry.raw);
+  }
+  return entry.tagged;
+}
 
 function copyThread(thread) {
   var copy = {};
@@ -763,11 +947,18 @@ function flushMessages() {
     // actually holds the previous one. Once anything has failed to land that
     // is no longer safe to assume, so the next poll resends every row.
     lastHostRow = {};
+    lastHostFault = {};
+    lastGlobalHostFault = "";
     if (appMessageFailureCount <= MAX_APP_MESSAGE_FAILURES) {
       appMessageQueue.unshift(message);
     } else {
+      // Do not report a broken AppMessage link over that same broken link.
+      // The old sendError() here retried its own failure forever at 250 ms.
+      // Drop stale payloads after the bounded attempt set; the watch's central
+      // error path schedules a fresh request, which repopulates the queue once
+      // the link can actually carry messages again.
       appMessageFailureCount = 0;
-      sendError("Watch link dropped a message");
+      appMessageQueue = [];
     }
     appMessageBusy = false;
     setTimeout(flushMessages, 250);
@@ -820,6 +1011,9 @@ function makeMessage(command, fields) {
   if (fields.settled !== undefined) message[KEY_SETTLED] = fields.settled;
   if (fields.path !== undefined) message[KEY_PATH] = fields.path;
   if (fields.name !== undefined) message[KEY_NAME] = fields.name;
+  if (fields.model !== undefined) message[KEY_MODEL] = fields.model;
+  if (fields.instanceId !== undefined) message[KEY_INSTANCE_ID] = fields.instanceId;
+  if (fields.isDefault !== undefined) message[KEY_IS_DEFAULT] = fields.isDefault;
   if (fields.counts !== undefined) {
     message[KEY_C_NEEDS] = fields.counts.needs;
     message[KEY_C_RUN] = fields.counts.run;
@@ -842,8 +1036,24 @@ function newestFirst(values) {
 // blockers are checked before any override, exactly as effectiveSettled does.
 
 var QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1000;
-var AUTO_SETTLE_AFTER_DAYS = 3; // T3's DEFAULT_SIDEBAR_AUTO_SETTLE_AFTER_DAYS
+var DEFAULT_AUTO_SETTLE_AFTER_DAYS = 3; // T3's DEFAULT_SIDEBAR_AUTO_SETTLE_AFTER_DAYS
+var MIN_AUTO_SETTLE_AFTER_DAYS = 1;     // T3's MIN/MAX_SIDEBAR_AUTO_SETTLE_AFTER_DAYS
+var MAX_AUTO_SETTLE_AFTER_DAYS = 90;
 var DAY_MS = 24 * 60 * 60 * 1000;
+
+// How long a quiet thread takes to settle on its own. T3 keeps this in the
+// browser's localStorage as sidebarAutoSettleAfterDays and never sends it to
+// the server, so there is no route the watch could read it from -- the number
+// has to be entered here to match. Hardcoding T3's default was wrong for
+// anyone who had changed it: every thread quiet for longer than their window
+// but shorter than three days reads as settled on the desktop and idle on the
+// watch, which is a whole band of the list disagreeing at once.
+//
+// Cached rather than read per thread: classifying forty threads would
+// otherwise re-parse the settings JSON forty times a poll. normalizeSettings()
+// refreshes it, and every poll reads the settings for its server list, so the
+// cache cannot outlive a settings change by more than one cycle.
+var autoSettleAfterDays = DEFAULT_AUTO_SETTLE_AFTER_DAYS;
 
 function parseTime(value) {
   if (!value) {
@@ -880,6 +1090,22 @@ function hasQueuedTurnStart(thread, nowMs) {
     }
   }
   return true;
+}
+
+function threadLastActivityMs(thread) {
+  var turn = thread.latestTurn || {};
+  var candidates = [thread.latestUserMessageAt, turn.requestedAt, turn.startedAt, turn.completedAt];
+  var latestMs = -Infinity;
+  for (var i = 0; i < candidates.length; i++) {
+    if (!candidates[i]) {
+      continue;
+    }
+    var ms = parseTime(candidates[i]);
+    if (ms > latestMs) {
+      latestMs = ms;
+    }
+  }
+  return latestMs;
 }
 
 function threadLastActivityAt(thread) {
@@ -928,7 +1154,34 @@ function effectiveSnoozed(thread, nowMs) {
   return !threadRaisedHandWhileSnoozed(thread);
 }
 
-function effectiveSettled(thread, nowMs) {
+// A turn that has run and finished, with no session still running on it. T3's
+// isLatestTurnSettled, which is what gates the plan prompt below.
+function latestTurnSettled(thread) {
+  var turn = thread.latestTurn;
+  if (!turn || !turn.startedAt || !turn.completedAt) {
+    return false;
+  }
+  var session = thread.session;
+  if (!session) {
+    return true;
+  }
+  return session.status !== "running";
+}
+
+// The third way a thread asks for something, after an approval and a question:
+// a plan-mode turn that finished with a plan waiting to be accepted. T3 shows
+// this as "Plan Ready" and it is the user's decision to make, so the watch has
+// to count it under "needs you" or the two disagree about a whole category of
+// blocked work. It is deliberately not a settle blocker: T3's effectiveSettled
+// does not consider it either, so a plan left for three days still ages out.
+function hasPlanReadyPrompt(thread) {
+  return !thread.hasPendingUserInput &&
+    thread.interactionMode === "plan" &&
+    !!thread.hasActionableProposedPlan &&
+    latestTurnSettled(thread);
+}
+
+function effectiveSettled(thread, nowMs, queuedTurnStart) {
   if (thread.hasPendingApprovals || thread.hasPendingUserInput) {
     return false;
   }
@@ -936,7 +1189,10 @@ function effectiveSettled(thread, nowMs) {
   if (status === "starting" || status === "running") {
     return false;
   }
-  if (hasQueuedTurnStart(thread, nowMs)) {
+  if (queuedTurnStart === undefined) {
+    queuedTurnStart = hasQueuedTurnStart(thread, nowMs);
+  }
+  if (queuedTurnStart) {
     // The queued blocker is forgivable when the server already adjudicated it
     // by accepting a settle after the message.
     var adjudicated = thread.settledOverride === "settled" && thread.settledAt &&
@@ -952,33 +1208,68 @@ function effectiveSettled(thread, nowMs) {
   if (thread.settledOverride === "active") {
     return false;
   }
-  if (AUTO_SETTLE_AFTER_DAYS === null) {
+  if (autoSettleAfterDays === null) {
     return false;
   }
-  var lastActivityAt = threadLastActivityAt(thread);
-  if (!lastActivityAt) {
+  var lastActivityMs = threadLastActivityMs(thread);
+  if (!isFinite(lastActivityMs)) {
     return false;
   }
-  return parseTime(lastActivityAt) < nowMs - AUTO_SETTLE_AFTER_DAYS * DAY_MS;
+  return lastActivityMs < nowMs - autoSettleAfterDays * DAY_MS;
 }
 
+// T3 answers two separate questions about a thread and the watch has to keep
+// them in that order, because the answers do not agree.
+//
+// Which list is it in? Snoozed, then pinned, then settled, then active -- and
+// the only things that hold a thread out of the settled list are the ones
+// effectiveSettled names: a pending approval or question, a live session, and
+// an unadopted turn start. Nothing else.
+//
+// What does the row say? The sidebar's pill order, which is a longer list:
+// it also labels lingering background work and a plan waiting to be accepted.
+//
+// Reading the pill first is what made a settled thread look busy. Background
+// liveness -- subagent and workflow fleets that outlive the turn that started
+// them -- is a pill in T3 and nothing more, so a thread the user settled with
+// a fleet still winding down sits quietly in T3's settled list while the watch
+// called it RUNNING and kept it in the active one. Same for a plan prompt, and
+// same for a snoozed thread whose session is still running: T3 keeps that on
+// the snooze shelf.
 function threadState(thread, nowMs) {
-  if (thread.hasPendingApprovals || thread.hasPendingUserInput) {
-    return "needs";
-  }
-  var status = thread.session && thread.session.status;
-  if (status === "starting" || status === "running" || thread.backgroundLiveness === "working" ||
-      hasQueuedTurnStart(thread, nowMs)) {
-    return "run";
-  }
-  if (effectiveSettled(thread, nowMs)) {
-    return "settled";
-  }
   if (effectiveSnoozed(thread, nowMs)) {
     return "snooze";
   }
+  var status = thread.session && thread.session.status;
+  var hasPending = thread.hasPendingApprovals || thread.hasPendingUserInput;
+  // A pin is the user saying "keep this in front of me", so it suspends the
+  // settled bucket entirely - including an explicit settle, which the server's
+  // decider clears the pin on anyway. Without this the watch buries a pinned
+  // thread in the settled list three days after its last turn while T3 still
+  // has it pinned to the top of the sidebar.
+  // Active queued threads used to perform this Date.parse-heavy test once in
+  // effectiveSettled() and a second time below for the RUNNING pill. Preserve
+  // the old short-circuit for pending and already-running threads, which do
+  // not need timestamps inspected at all.
+  var queuedTurnStart = !hasPending && status !== "starting" && status !== "running" ?
+    hasQueuedTurnStart(thread, nowMs) : false;
+  if (!thread.pinnedAt && effectiveSettled(thread, nowMs, queuedTurnStart)) {
+    return "settled";
+  }
+  if (hasPending) {
+    return "needs";
+  }
+  if (status === "starting" || status === "running" || queuedTurnStart) {
+    return "run";
+  }
   if (status === "error" || (thread.latestTurn && thread.latestTurn.state === "error")) {
     return "err";
+  }
+  if (hasPlanReadyPrompt(thread)) {
+    return "needs";
+  }
+  if (thread.backgroundLiveness === "working") {
+    return "run";
   }
   return "idle";
 }
@@ -1014,6 +1305,11 @@ function relativeAge(iso, nowMs) {
 
 function threadDetailLine(thread, state, nowMs, waitingSince) {
   if (state === "needs") {
+    // A plan waiting to be accepted carries no request to have been waiting
+    // on, so it gets T3's own words rather than an empty "waiting for answer".
+    if (!thread.hasPendingApprovals && !thread.hasPendingUserInput) {
+      return "plan ready";
+    }
     var kind = thread.hasPendingApprovals ? "approval" : "answer";
     var waited = waitingSince ? relativeAge(waitingSince, nowMs) : "";
     return waited ? "waiting " + waited + " for " + kind : "needs " + kind;
@@ -1038,11 +1334,16 @@ function threadDetailLine(thread, state, nowMs, waitingSince) {
   return age ? "idle " + age : "idle";
 }
 
-function activeThreads(snapshot) {
+// Every thread a host is still holding. Deliberately unpaged: the home
+// screen's counts are a claim about the whole machine, so capping this at
+// MAX_SESSIONS would let a thread past the cap wait for an approval that the
+// "N need you" readout never mentions. The cap belongs to the list, which
+// pages, not to the roll-up.
+function liveThreads(snapshot) {
   var threads = snapshot && snapshot.threads ? snapshot.threads : [];
-  return newestFirst(threads.filter(function(thread) {
+  return threads.filter(function(thread) {
     return !thread.deletedAt && !thread.archivedAt;
-  })).slice(0, MAX_SESSIONS);
+  });
 }
 
 // True when a thread is not asking for anything: explicitly settled, aged out
@@ -1051,18 +1352,65 @@ function isRestingState(state) {
   return state === "settled" || state === "snooze";
 }
 
-// One scope's worth of threads, newest first and unpaged. Ordering stays by
-// activity rather than by settledAt, so a thread that aged out sits where its
-// work left it rather than jumping to the moment the server noticed.
-function threadsForScope(snapshot, scope, nowMs) {
-  var threads = snapshot && snapshot.threads ? snapshot.threads : [];
-  var wantResting = scope === SCOPE_SETTLED;
-  return newestFirst(threads.filter(function(thread) {
-    if (thread.deletedAt || thread.archivedAt) {
-      return false;
+// When a settled thread's work ended. T3's resolveSettledTimestamp: the moment
+// the user settled it if they did, otherwise the last thing that actually
+// happened on it, with updatedAt only as a last resort -- the projection bumps
+// updatedAt for things that are not work, so it is not a record of activity.
+function settledTimestamp(thread) {
+  if (thread.settledAt && !isNaN(parseTime(thread.settledAt))) {
+    return thread.settledAt;
+  }
+  return threadLastActivityAt(thread) || thread.updatedAt || null;
+}
+
+function byTimeDescending(stamp) {
+  return function(left, right) {
+    return (parseTime(stamp(right)) || 0) - (parseTime(stamp(left)) || 0) ||
+      compareStrings(left.id, right.id);
+  };
+}
+
+// One scope's worth of threads, unpaged, in the order T3 puts them in. The two
+// lists sort differently there and the watch has to match, or the same host
+// reads as a different pile of work:
+//
+//   Active rows order by creation (sortThreadsForSidebar / sortThreadsForListV2),
+//   so a row holds its place while its turns land. Sorting by updatedAt instead
+//   made the list reshuffle under the user every time an agent said anything.
+//
+//   Settled rows are history, so they order by when the work ENDED.
+function threadCreatedAt(thread) {
+  return thread.createdAt;
+}
+
+// Both scopes in one pass, plus the state each thread landed in. A screen needs
+// the list it is showing AND the size of the one it is not, and working those
+// out separately meant classifying every thread twice -- threadState() is
+// several Date.parse calls deep. Doing it once also guarantees the two answers
+// agree about the clock, which two calls a millisecond apart do not.
+function partitionByScope(snapshot, nowMs) {
+  var active = [];
+  var resting = [];
+  var stateById = {};
+  var threads = liveThreads(snapshot);
+  for (var i = 0; i < threads.length; i++) {
+    var thread = threads[i];
+    var state = threadState(thread, nowMs);
+    stateById[thread.id] = state;
+    if (isRestingState(state)) {
+      resting.push(thread);
+    } else {
+      active.push(thread);
     }
-    return isRestingState(threadState(thread, nowMs)) === wantResting;
-  }));
+  }
+  active.sort(byTimeDescending(threadCreatedAt));
+  resting.sort(byTimeDescending(settledTimestamp));
+  return { active: active, resting: resting, stateById: stateById };
+}
+
+function threadsForScope(snapshot, scope, nowMs) {
+  var split = partitionByScope(snapshot, nowMs);
+  return scope === SCOPE_SETTLED ? split.resting : split.active;
 }
 
 function activeProjects(snapshot) {
@@ -1088,8 +1436,8 @@ function projectTitle(project) {
 }
 
 
-// The watch does not pick models. Whatever the server has configured wins;
-// the fallback only covers a project that carries no default at all.
+// The project default is the first choice in the watch's model menu. The
+// fallback only covers a project that carries no default at all.
 function resolveModelSelection(selection) {
   if (!selection || !trim(selection.model)) {
     return {
@@ -1105,6 +1453,107 @@ function resolveModelSelection(selection) {
     resolved.options = selection.options;
   }
   return resolved;
+}
+
+function providerCanStartThreads(provider) {
+  return provider && provider.enabled !== false && provider.installed !== false &&
+    provider.status !== "unavailable" && provider.models && provider.models.length;
+}
+
+function modelDisplayName(config, instanceId, modelSlug) {
+  var providers = (config && config.providers) || [];
+  for (var i = 0; i < providers.length; i++) {
+    if (providers[i].instanceId !== instanceId) {
+      continue;
+    }
+    var models = providers[i].models || [];
+    for (var j = 0; j < models.length; j++) {
+      if (models[j].slug === modelSlug) {
+        return models[j].name || models[j].slug;
+      }
+    }
+  }
+  return modelSlug;
+}
+
+function modelChoices(project, config) {
+  var selection = resolveModelSelection(project && project.defaultModelSelection);
+  var choices = [{
+    instanceId: selection.instanceId,
+    model: selection.model,
+    label: compact("Default · " + modelDisplayName(config, selection.instanceId, selection.model), 52),
+    isDefault: true
+  }];
+  var seen = {};
+  seen[selection.instanceId + "\n" + selection.model] = true;
+  var providers = ((config && config.providers) || []).slice().sort(function(left, right) {
+    if (left.instanceId === selection.instanceId) return -1;
+    if (right.instanceId === selection.instanceId) return 1;
+    return String(left.displayName || left.instanceId).localeCompare(String(right.displayName || right.instanceId));
+  });
+  for (var i = 0; i < providers.length && choices.length < MAX_MODEL_CHOICES; i++) {
+    var provider = providers[i];
+    if (!providerCanStartThreads(provider)) {
+      continue;
+    }
+    var providerName = provider.displayName || provider.instanceId;
+    for (var j = 0; j < provider.models.length && choices.length < MAX_MODEL_CHOICES; j++) {
+      var model = provider.models[j] || {};
+      var key = provider.instanceId + "\n" + model.slug;
+      // Legacy models remain valid for an existing/default selection, but do
+      // not crowd a tiny new-thread menu with choices T3 itself has retired.
+      if (!trim(model.slug) || model.isLegacy || seen[key]) {
+        continue;
+      }
+      seen[key] = true;
+      choices.push({
+        instanceId: provider.instanceId,
+        model: model.slug,
+        label: compact(providerName + " · " + (model.name || model.slug), 52),
+        isDefault: false
+      });
+    }
+  }
+  return choices;
+}
+
+function sendModelChoices(choices) {
+  for (var i = 0; i < choices.length; i++) {
+    send(makeMessage(CMD_MODEL_ITEM, {
+      index: i,
+      total: choices.length,
+      title: choices[i].label,
+      model: choices[i].model,
+      instanceId: choices[i].instanceId,
+      isDefault: choices[i].isDefault ? 1 : 0
+    }));
+  }
+  send(makeMessage(CMD_MODEL_END, { total: choices.length }));
+}
+
+function requestProjectModels(projectId) {
+  if (!projectId) {
+    sendError("No project selected");
+    return;
+  }
+  withProject(projectId, function(error, project) {
+    if (error || !project) {
+      sendError(error || "Project not found");
+      return;
+    }
+    var server = serverById(project.serverId);
+    if (!server) {
+      sendError("Unknown T3 server");
+      return;
+    }
+    fetchServerConfig(server, function(configError, config) {
+      // Starting a thread must remain possible on old phone runtimes or while
+      // the config RPC is unavailable. The shell already supplied the exact
+      // server-side project default, so it is a safe one-row fallback.
+      void configError;
+      sendModelChoices(modelChoices(project, config || null));
+    });
+  });
 }
 
 function activityPayload(activity) {
@@ -1157,9 +1606,11 @@ function isStalePendingFailure(detail) {
     normalized.indexOf("unknown pending user-input request") !== -1;
 }
 
+// Takes activities already ordered by compareActivities -- see sendThreadDetail,
+// which orders once and hands the same array to both derivations.
 function derivePendingApprovals(activities) {
   var open = {};
-  activities = (activities || []).slice().sort(compareActivities);
+  activities = activities || [];
   for (var i = 0; i < activities.length; i++) {
     var activity = activities[i];
     var payload = activityPayload(activity);
@@ -1209,9 +1660,10 @@ function parseUserInputQuestions(payload) {
   return parsed.length ? parsed : null;
 }
 
+// Also takes an already-ordered list; see derivePendingApprovals.
 function derivePendingUserInputs(activities) {
   var open = {};
-  activities = (activities || []).slice().sort(compareActivities);
+  activities = activities || [];
   for (var i = 0; i < activities.length; i++) {
     var activity = activities[i];
     var payload = activityPayload(activity);
@@ -1314,11 +1766,15 @@ function toPebbleMessage(message) {
 
 function rollupForThreads(threads, nowMs) {
   var counts = { needs: 0, run: 0, err: 0, idle: 0, settled: 0, snooze: 0 };
+  counts.total = 0;
   for (var i = 0; i < threads.length; i++) {
+    if (threads[i].deletedAt || threads[i].archivedAt) {
+      continue;
+    }
     var state = threadState(threads[i], nowMs);
     counts[state] = (counts[state] || 0) + 1;
+    counts.total++;
   }
-  counts.total = threads.length;
   return counts;
 }
 
@@ -1342,9 +1798,13 @@ function hostDetailLine(state, counts) {
   return "no threads";
 }
 
-function refreshHosts() {
+function refreshHosts(afterCurrent) {
   if (SCREENSHOT_FIXTURES) {
     fixtureRefreshHosts();
+    return;
+  }
+  if (hostRefreshInFlight) {
+    hostRefreshAfterCurrent = hostRefreshAfterCurrent || !!afterCurrent;
     return;
   }
   var servers = configuredServers();
@@ -1354,6 +1814,7 @@ function refreshHosts() {
     return;
   }
 
+  hostRefreshInFlight = true;
   var nowMs = Date.now();
   var rows = new Array(servers.length);
   eachLimit(servers, SERVER_CONCURRENCY, function(server, index, next) {
@@ -1373,8 +1834,10 @@ function refreshHosts() {
         next();
         return;
       }
-      shellByServer[server.id] = tagSnapshot(server, snapshot);
-      var threads = activeThreads(shellByServer[server.id]);
+      var entry = cacheShell(server, snapshot);
+      // Avoid allocating a filtered copy solely for a one-pass roll-up.
+      // rollupForThreads skips archived/deleted rows itself.
+      var threads = entry.raw && entry.raw.threads ? entry.raw.threads : [];
       var counts = rollupForThreads(threads, nowMs);
       var state = hostStateFromCounts(counts);
       rows[index] = {
@@ -1397,9 +1860,14 @@ function refreshHosts() {
     // host, not one joined line: the fault log keeps six entries, so two down
     // machines should cost two of them rather than share a truncated one.
     var unreachable = 0;
+    var nextFaults = {};
     for (var f = 0; f < rows.length; f++) {
       if (rows[f] && rows[f].state === "offline") {
-        sendError(rows[f].title + ": " + rows[f].detail);
+        var fault = rows[f].title + ": " + rows[f].detail;
+        nextFaults[rows[f].id] = fault;
+        if (lastHostFault[rows[f].id] !== fault) {
+          sendError(fault);
+        }
         if (rows[f].transport) {
           unreachable++;
         }
@@ -1409,9 +1877,13 @@ function refreshHosts() {
     // one link. Sent last so it sits at the top of a newest-first fault log,
     // above the six rows that are all really saying this. Only worth stating
     // when there is more than one host to generalise from.
-    if (rows.length > 1 && unreachable === rows.length) {
-      sendError("All " + rows.length + " hosts unreachable - is Tailscale on for the phone?");
+    var globalFault = rows.length > 1 && unreachable === rows.length ?
+      "All " + rows.length + " hosts unreachable - is Tailscale on for the phone?" : "";
+    if (globalFault && lastGlobalHostFault !== globalFault) {
+      sendError(globalFault);
     }
+    lastHostFault = nextFaults;
+    lastGlobalHostFault = globalFault;
     // Bluetooth is the other big battery consumer, and a poll that restates
     // unchanged numbers spends it for nothing. Skip a host whose row is
     // byte-identical to the one the watch already has; CMD_HOST_END still goes
@@ -1439,6 +1911,11 @@ function refreshHosts() {
     // if it comes back unchanged.
     lastHostRow = next;
     send(makeMessage(CMD_HOST_END, { total: rows.length }));
+    hostRefreshInFlight = false;
+    if (hostRefreshAfterCurrent) {
+      hostRefreshAfterCurrent = false;
+      refreshHosts();
+    }
   });
 }
 
@@ -1461,7 +1938,9 @@ function selectHost(hostId, scope, offset) {
   function emit(tagged) {
     lastSnapshot = tagged;
     var nowMs = Date.now();
-    var matched = threadsForScope(tagged, scope, nowMs);
+    var split = partitionByScope(tagged, nowMs);
+    var wantResting = scope === SCOPE_SETTLED;
+    var matched = wantResting ? split.resting : split.active;
     // Settled history outgrows the watch's fixed list, so it arrives a page at
     // a time rather than by raising the cap for a list that is rarely opened.
     if (offset >= matched.length) {
@@ -1469,7 +1948,7 @@ function selectHost(hostId, scope, offset) {
     }
     var page = matched.slice(offset, offset + MAX_SESSIONS);
     sendSessionItems(page.map(function(thread) {
-      var state = threadState(thread, nowMs);
+      var state = split.stateById[thread.id];
       return {
         id: thread.id,
         title: compact(thread.title || "Untitled", 54),
@@ -1477,7 +1956,9 @@ function selectHost(hostId, scope, offset) {
         state: state,
         summary: "",
         requestId: "",
-        requestKind: state === "needs" ? (thread.hasPendingApprovals ? "permission" : "question") : "",
+        // Only a real request gets a kind: a plan-ready row reads as "needs"
+        // but has nothing to respond to, so a reply there is a plain message.
+        requestKind: thread.hasPendingApprovals ? "permission" : (thread.hasPendingUserInput ? "question" : ""),
         settled: isRestingState(state)
       };
     }), {
@@ -1486,14 +1967,14 @@ function selectHost(hostId, scope, offset) {
       matched: matched.length,
       // The count for the other scope's footer row, so the watch can label the
       // way out without asking for a list it is not showing.
-      other: threadsForScope(tagged, scope === SCOPE_ACTIVE ? SCOPE_SETTLED : SCOPE_ACTIVE, nowMs).length
+      other: wantResting ? split.active.length : split.resting.length
     });
     sendProjectItems(activeProjects(tagged).map(toPebbleProject));
   }
 
   var cached = shellByServer[hostId];
   if (cached) {
-    emit(cached);
+    emit(taggedShell(cached));
     return;
   }
   httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
@@ -1502,8 +1983,7 @@ function selectHost(hostId, scope, offset) {
       send(makeMessage(CMD_SESSION_END, { total: 0 }));
       return;
     }
-    shellByServer[hostId] = tagSnapshot(server, snapshot);
-    emit(shellByServer[hostId]);
+    emit(taggedShell(cacheShell(server, snapshot)));
   });
 }
 
@@ -1762,9 +2242,7 @@ function eachLimit(items, limit, worker, done) {
 
 function sendSessionItems(items, page) {
   page = page || {};
-  cachedSessions = {};
   for (var i = 0; i < items.length; i++) {
-    cachedSessions[items[i].id] = items[i];
     send(makeMessage(CMD_SESSION_ITEM, itemFields(items[i], i, items.length)));
   }
   send(makeMessage(CMD_SESSION_END, {
@@ -1780,9 +2258,7 @@ function sendSessionItems(items, page) {
 
 
 function sendProjectItems(items) {
-  cachedProjects = {};
   for (var i = 0; i < items.length; i++) {
-    cachedProjects[items[i].id] = items[i];
     send(makeMessage(CMD_PROJECT_ITEM, {
       index: i,
       total: items.length,
@@ -1822,10 +2298,20 @@ function loadMessages(sessionId, limit, directory, callback) {
       callback(error);
       return;
     }
-    var messages = (thread.messages || []).slice().sort(function(left, right) {
-      return messageTime(toPebbleMessage(right)) - messageTime(toPebbleMessage(left));
-    }).slice(0, limit).map(toPebbleMessage);
-    callback(null, messages);
+    // Decorate, sort, undecorate. The comparator used to build two throwaway
+    // message objects on every comparison, so ordering a 60-message transcript
+    // allocated well over a thousand of them and re-walked each one's
+    // timestamps. Now each message is converted and timed exactly once.
+    var decorated = (thread.messages || []).map(function(message, index) {
+      var converted = toPebbleMessage(message);
+      return { message: converted, time: messageTime(converted), index: index };
+    });
+    decorated.sort(function(left, right) {
+      return (right.time - left.time) || (left.index - right.index);
+    });
+    callback(null, decorated.slice(0, limit).map(function(entry) {
+      return entry.message;
+    }));
   });
 }
 
@@ -2001,8 +2487,11 @@ function detail(sessionId, index) {
 function sendThreadDetail(sessionId, index, lifecycle, thread) {
   {
     var nowMs = Date.now();
-    var approval = derivePendingApprovals(thread.activities)[0];
-    var input = derivePendingUserInputs(thread.activities)[0];
+    // Both walks want the same list in the same order, and each used to sort
+    // its own copy of it.
+    var ordered = (thread.activities || []).slice().sort(compareActivities);
+    var approval = derivePendingApprovals(ordered)[0];
+    var input = derivePendingUserInputs(ordered)[0];
     // Activities are fresher than a cached shell, so a request that landed
     // since the last roll-up still reads as needing an answer.
     var state = (approval || input) ? "needs" : threadState(lifecycle, nowMs);
@@ -2041,7 +2530,6 @@ function sendThreadDetail(sessionId, index, lifecycle, thread) {
       requestId: approval ? approval.requestId : (input ? input.requestId : ""),
       requestKind: approval ? "permission" : (input ? "question" : "")
     };
-    cachedSessions[sessionId] = item;
     send(makeMessage(CMD_DETAIL, itemFields(item, index, 1)));
   }
 }
@@ -2524,7 +3012,7 @@ function promptSession(sessionId, text) {
   });
 }
 
-function promptNewThread(projectId, text) {
+function promptNewThread(projectId, text, instanceId, model) {
   if (!projectId || !text) {
     sendError("No new thread prompt");
     return;
@@ -2543,9 +3031,16 @@ function promptNewThread(projectId, text) {
     }
     var now = new Date().toISOString();
     var threadId = randomId("pebble-thread-");
-    // A new thread has to name a model, so use the project's default from the
-    // server and only fall back when it has none.
-    var selection = resolveModelSelection(project.defaultModelSelection);
+    // Selecting the default keeps its server-side options as well as its
+    // model. Other menu rows identify an exact live provider/model pair.
+    var defaultSelection = resolveModelSelection(project.defaultModelSelection);
+    var selection = trim(instanceId) && trim(model) ? {
+      instanceId: trim(instanceId),
+      model: trim(model)
+    } : defaultSelection;
+    if (selection.instanceId === defaultSelection.instanceId && selection.model === defaultSelection.model) {
+      selection = defaultSelection;
+    }
     // Two commands, not one. `thread.turn.start` accepts a
     // `bootstrap.createThread` block and the REST route validates it, but only
     // the WebSocket path routes such a command through the branch that creates
@@ -2606,7 +3101,7 @@ function withShellFor(compositeId, callback) {
   }
   var cached = shellByServer[serverId];
   if (cached) {
-    callback(null, cached);
+    callback(null, taggedShell(cached));
     return;
   }
   httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
@@ -2614,8 +3109,7 @@ function withShellFor(compositeId, callback) {
       callback(error);
       return;
     }
-    shellByServer[serverId] = tagSnapshot(server, snapshot);
-    callback(null, shellByServer[serverId]);
+    callback(null, taggedShell(cacheShell(server, snapshot)));
   });
 }
 
@@ -2721,6 +3215,18 @@ function configurationHtml() {
     "<p class='hint' id='pasteMsg'></p></div>",
     "<div id='servers'></div>",
     "<button class='add' onclick='addServer()'>+ Add server</button>",
+    // T3 keeps this in the browser's own storage and never sends it to the
+    // server, so there is nothing for the watch to read: it has to be typed in
+    // to match, or the two disagree about every thread quiet for longer than
+    // one window and less than the other.
+    "<div class='card'><h3>Settled</h3>",
+    "<label>Settle a quiet thread after</label>",
+    "<input id='autoSettle' type='number' min='", String(MIN_AUTO_SETTLE_AFTER_DAYS),
+    "' max='", String(MAX_AUTO_SETTLE_AFTER_DAYS), "' placeholder='never' value='",
+    current.autoSettleAfterDays === null ? "" : String(current.autoSettleAfterDays), "'>",
+    "<p class='hint'>Days, or blank for never. Match this to T3 Code's own setting ",
+    "(Settings, then <code>Days of inactivity before auto-settle</code>) or the watch and ",
+    "the desktop will disagree about which threads are done.</p></div>",
     "<button onclick='save()'>Save</button>",
     "<script>",
     "var MAX=", String(MAX_SERVERS), ";",
@@ -2758,7 +3264,10 @@ function configurationHtml() {
     "render();}",
     "function addServer(){if(servers.length>=MAX){return;}servers.push({id:'',label:'',baseUrl:'',token:'',projectRoot:'',concierge:''});render();}",
     "function removeServer(i){servers.splice(i,1);if(!servers.length){servers.push({id:'',label:'',baseUrl:'',token:'',projectRoot:'',concierge:''});}render();}",
-    "function save(){location.href='pebblejs://close#'+encodeURIComponent(JSON.stringify({servers:servers}));}",
+    "function autoSettleValue(){var raw=document.getElementById('autoSettle').value;",
+    "if(!String(raw).trim()){return null;}var n=parseInt(raw,10);return isNaN(n)?null:n;}",
+    "function save(){location.href='pebblejs://close#'+encodeURIComponent(JSON.stringify(",
+    "{servers:servers,autoSettleAfterDays:autoSettleValue()}));}",
     "render();",
     "</script></body></html>"
   ].join("");
@@ -2794,6 +3303,8 @@ Pebble.addEventListener("appmessage", function(event) {
     createProject(message[KEY_HOST_ID], trim(message[KEY_NAME]), trim(message[KEY_PATH]));
   } else if (command === CMD_CONCIERGE) {
     conciergeProject(message[KEY_HOST_ID], trim(message[KEY_PROMPT]));
+  } else if (command === CMD_MODEL_REQUEST) {
+    requestProjectModels(message[KEY_PROJECT_ID]);
   } else if (command === CMD_DETAIL) {
     detail(message[KEY_SESSION_ID], message[KEY_INDEX] || 0);
   } else if (command === CMD_CONTEXT) {
@@ -2801,7 +3312,8 @@ Pebble.addEventListener("appmessage", function(event) {
   } else if (command === CMD_PROMPT) {
     submitResponse(message);
   } else if (command === CMD_NEW_THREAD) {
-    promptNewThread(message[KEY_PROJECT_ID], trim(message[KEY_PROMPT]));
+    promptNewThread(message[KEY_PROJECT_ID], trim(message[KEY_PROMPT]),
+      message[KEY_INSTANCE_ID], message[KEY_MODEL]);
   }
 });
 
@@ -2816,10 +3328,13 @@ Pebble.addEventListener("webviewclosed", function(event) {
   try {
     saveSettings(JSON.parse(decodeURIComponent(event.response)));
     shellByServer = {};
+    modelConfigByServer = {};
     // A host may have been added, removed or relabelled, so nothing the watch
     // is holding can be assumed still current.
     lastHostRow = {};
-    refreshHosts();
+    lastHostFault = {};
+    lastGlobalHostFault = "";
+    refreshHosts(true);
   } catch (e) {
     sendError("Settings not saved");
   }

@@ -15,6 +15,7 @@ const CMD = {
   context: 7, status: 8, projectItem: 9, projectEnd: 10, newThread: 11,
   hostItem: 12, hostEnd: 13, selectHost: 14, threadAction: 15,
   projectName: 16, projectPreview: 17, projectCreate: 18, concierge: 19,
+  modelRequest: 20, modelItem: 21, modelEnd: 22,
 }
 
 const KEY = {
@@ -22,6 +23,7 @@ const KEY = {
   prompt: "prompt", requestId: "request_id", requestKind: "request_kind",
   contextPage: "context_page", hostId: "host_id", scope: "scope",
   offset: "offset", action: "action", name: "name", path: "path",
+  model: "model", instanceId: "instance_id", isDefault: "is_default",
 }
 
 function baseThread(overrides = {}) {
@@ -413,19 +415,37 @@ async function main() {
   // The watch never imposes a model on an existing thread.
   assert.strictEqual(state.dispatches[1].modelSelection, undefined)
 
-  // --- a new thread uses the project's server-side default --------------
+  // --- a new thread model is selected before dictation ------------------
+  bridge.sentMessages.length = 0
   bridge.listeners.appmessage({
-    payload: { [KEY.cmd]: CMD.newThread, [KEY.projectId]: "s1::proj_pebble", [KEY.prompt]: "start fresh" },
+    payload: { [KEY.cmd]: CMD.modelRequest, [KEY.projectId]: "s1::proj_pebble" },
+  })
+  // The test phone has no WebSocket implementation, so the bridge degrades
+  // to the exact project default already carried by the shell snapshot.
+  await waitFor(() => bridge.sentMessages.some((m) => m.cmd === CMD.modelEnd), "model menu")
+  const fallbackModels = bridge.sentMessages.filter((m) => m.cmd === CMD.modelItem)
+  assert.strictEqual(fallbackModels.length, 1)
+  assert.strictEqual(fallbackModels[0].model, "gpt-5-codex")
+  assert.strictEqual(fallbackModels[0].is_default, 1)
+
+  bridge.listeners.appmessage({
+    payload: {
+      [KEY.cmd]: CMD.newThread,
+      [KEY.projectId]: "s1::proj_pebble",
+      [KEY.prompt]: "start fresh",
+      [KEY.instanceId]: "codex",
+      [KEY.model]: "gpt-5.6-terra",
+    },
   })
   // The REST dispatch route ignores bootstrap.createThread, so the thread is
   // created explicitly and the turn then starts against it.
   await waitFor(() => state.dispatches.length === 4, "new thread dispatch")
   assert.strictEqual(state.dispatches[2].type, "thread.create")
   assert.strictEqual(state.dispatches[2].projectId, "proj_pebble")
-  assert.strictEqual(state.dispatches[2].modelSelection.model, "gpt-5-codex")
+  assert.strictEqual(state.dispatches[2].modelSelection.model, "gpt-5.6-terra")
   assert.strictEqual(state.dispatches[3].type, "thread.turn.start")
   assert.strictEqual(state.dispatches[3].threadId, state.dispatches[2].threadId)
-  assert.strictEqual(state.dispatches[3].modelSelection.model, "gpt-5-codex")
+  assert.strictEqual(state.dispatches[3].modelSelection.model, "gpt-5.6-terra")
 
   // --- creating a project from the watch --------------------------------
 

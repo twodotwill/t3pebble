@@ -12,6 +12,7 @@ let requests = []
 let dispatches = []
 let shells = {}
 let deadHosts = new Set()
+let webSocketRequests = []
 
 const HOST_A = "100.64.0.10:3773"
 const HOST_B = "100.64.0.11:3773"
@@ -43,10 +44,12 @@ function shellThread(overrides = {}) {
     settledAt: null,
     snoozedUntil: null,
     snoozedAt: null,
+    pinnedAt: null,
     session: { status: "ready", providerName: "codex", updatedAt: iso(58000) },
     latestUserMessageAt: iso(60000),
     hasPendingApprovals: false,
     hasPendingUserInput: false,
+    hasActionableProposedPlan: false,
     backgroundLiveness: null,
     planProgress: null,
     ...overrides,
@@ -80,6 +83,10 @@ function routeRequest(method, url, body) {
   if (method === "POST" && pathname === "/api/orchestration/dispatch") {
     dispatches.push(JSON.parse(body))
     return { status: 200, body: JSON.stringify({ sequence: 1 }) }
+  }
+
+  if (method === "POST" && pathname === "/api/auth/websocket-ticket") {
+    return { status: 200, body: JSON.stringify({ ticket: "short-lived-ticket", expiresAt: iso(-60000) }) }
   }
 
   const shell = shells[host]
@@ -162,11 +169,44 @@ class FakeXMLHttpRequest {
   abort() {}
 }
 
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url
+    webSocketRequests.push({ url })
+    setTimeout(() => this.onopen && this.onopen(), 0)
+  }
+  send(body) {
+    const request = JSON.parse(body)
+    webSocketRequests[webSocketRequests.length - 1].request = request
+    setTimeout(() => {
+      if (this.onmessage) {
+        this.onmessage({ data: JSON.stringify({
+          _tag: "Exit",
+          requestId: request.id,
+          exit: {
+            _tag: "Success",
+            value: {
+              providers: [{
+                instanceId: "codex", displayName: "Codex", enabled: true, installed: true, status: "ready",
+                models: [{ slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" }],
+              }],
+            },
+          },
+        }) })
+      }
+    }, 0)
+  }
+  close() {
+    if (this.onclose) this.onclose()
+  }
+}
+
 const context = {
   console,
   setTimeout,
   clearTimeout,
   XMLHttpRequest: FakeXMLHttpRequest,
+  WebSocket: FakeWebSocket,
   localStorage: {
     getItem(key) {
       if (key === "t3pebble_settings") return storedSettings
@@ -234,13 +274,46 @@ const CMD = {
 }
 
 async function main() {
+  // A permanently broken watch link must stop after its bounded retry set.
+  // Previously the terminal failure enqueued an error onto the same broken
+  // link, and that error recursively recreated itself forever.
+  const realSendAppMessage = context.Pebble.sendAppMessage
+  const realSetTimeout = context.setTimeout
+  const realMaxFailures = context.MAX_APP_MESSAGE_FAILURES
+  let failedSends = 0
+  context.MAX_APP_MESSAGE_FAILURES = 1
+  context.setTimeout = (callback) => callback()
+  context.Pebble.sendAppMessage = (message, success, failure) => {
+    failedSends++
+    failure()
+  }
+  context.send({ cmd: 999 })
+  assert.strictEqual(failedSends, 2)
+  assert.strictEqual(context.appMessageQueue.length, 0)
+  assert.strictEqual(context.appMessageBusy, false)
+  context.Pebble.sendAppMessage = realSendAppMessage
+  context.setTimeout = realSetTimeout
+  context.MAX_APP_MESSAGE_FAILURES = realMaxFailures
+
   // ---------------------------------------------------------------- settings
-  assertJsonEqual(context.settings(), { servers: [], nextServerId: 1 })
+  assertJsonEqual(context.settings(), { servers: [], nextServerId: 1, autoSettleAfterDays: 3 })
 
   assert.match(context.configurationHtml(), /Base URL/)
   assert.match(context.configurationHtml(), /Access token/)
   assert.match(context.configurationHtml(), /Label/)
   assert.match(context.configurationHtml(), /Add server/)
+  assert.match(context.configurationHtml(), /Settle a quiet thread after/)
+
+  // The auto-settle window is the one classification input T3 keeps to itself,
+  // so it has to survive the round trip and clamp to T3's own 1..90 range.
+  // Anything unreadable falls back to T3's default rather than to "never" -- a
+  // typo must not stop the watch settling anything ever again.
+  assert.strictEqual(context.normalizeAutoSettleDays(null), null)
+  assert.strictEqual(context.normalizeAutoSettleDays(undefined), 3)
+  assert.strictEqual(context.normalizeAutoSettleDays("banana"), 3)
+  assert.strictEqual(context.normalizeAutoSettleDays(0), 1)
+  assert.strictEqual(context.normalizeAutoSettleDays(500), 90)
+  assert.strictEqual(context.normalizeAutoSettleDays("7"), 7)
 
   storedSettings = JSON.stringify({ baseUrl: "http://old-host:4096", token: "keep-me" })
   context.localStorage.setItem("t3pebble_build_label", "v0.2.0")
@@ -250,6 +323,7 @@ async function main() {
       projectRoot: "", concierge: "",
     }],
     nextServerId: 2,
+    autoSettleAfterDays: 3,
   })
 
   context.localStorage.setItem("t3pebble_build_label", context.BUILD_LABEL)
@@ -274,6 +348,50 @@ async function main() {
     instanceId: "codex",
     model: "gpt-5.4",
   })
+  const choices = context.modelChoices({
+    defaultModelSelection: { instanceId: "codex-work", model: "gpt-5.6-sol" },
+  }, {
+    providers: [
+      {
+        instanceId: "claudeAgent", displayName: "Claude", enabled: true, installed: true, status: "ready",
+        models: [
+          { slug: "claude-opus-5", name: "Claude Opus 5" },
+          { slug: "claude-opus-4-8", name: "Claude Opus 4.8", isLegacy: true },
+        ],
+      },
+      {
+        instanceId: "codex-work", displayName: "Codex Work", enabled: true, installed: true, status: "ready",
+        models: [
+          { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+          { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+        ],
+      },
+      {
+        instanceId: "offline", displayName: "Offline", enabled: false, installed: true,
+        models: [{ slug: "never-show", name: "Never Show" }],
+      },
+    ],
+  })
+  assertJsonEqual(choices.map((choice) => [choice.instanceId, choice.model, choice.isDefault]), [
+    ["codex-work", "gpt-5.6-sol", true],
+    ["codex-work", "gpt-5.6-terra", false],
+    ["claudeAgent", "claude-opus-5", false],
+  ])
+  assert.match(choices[0].label, /^Default/)
+
+  const fetchedConfig = await new Promise((resolve, reject) => {
+    context.fetchServerConfig({ id: "s1", baseUrl: "http://100.64.0.10:3773", token: "token-a" }, (error, value) => {
+      if (error) reject(error)
+      else resolve(value)
+    })
+  })
+  assert.strictEqual(fetchedConfig.providers[0].models[0].slug, "gpt-5.6-sol")
+  assert.match(webSocketRequests[0].url, /^ws:\/\/100\.64\.0\.10:3773\/ws\?wsTicket=/)
+  assertJsonEqual(webSocketRequests[0].request, {
+    _tag: "Request", id: 1, tag: "server.getConfig", payload: {}, headers: [],
+  })
+  const ticketRequest = requests.find((request) => request.pathname === "/api/auth/websocket-ticket")
+  assert.strictEqual(ticketRequest.headers.authorization, "Bearer token-a")
 
   // ------------------------------------------------ settled classification
   // Mirrors T3 Code's effectiveSettled: activity blockers outrank any override.
@@ -285,7 +403,34 @@ async function main() {
   assert.strictEqual(st({ session: { status: "starting", updatedAt: iso(1000) } }), "run")
   assert.strictEqual(st({ backgroundLiveness: "working" }), "run")
 
-  // A blocker beats an explicit settle, exactly as upstream does.
+  // Background liveness is a label in T3, never a settle blocker: a fleet of
+  // subagents winding down after the turn does not hold a settled thread in
+  // the active list. This is the one that made settled threads read RUNNING.
+  assert.strictEqual(st({ settledOverride: "settled", backgroundLiveness: "working" }), "settled")
+  assert.strictEqual(
+    st({
+      backgroundLiveness: "working",
+      latestUserMessageAt: iso(5 * DAY_MS),
+      latestTurn: { state: "completed", requestedAt: iso(5 * DAY_MS), startedAt: iso(5 * DAY_MS), completedAt: iso(5 * DAY_MS) },
+    }),
+    "settled",
+  )
+  // A live session IS a blocker, so it still outranks an explicit settle.
+  assert.strictEqual(
+    st({ settledOverride: "settled", session: { status: "running", updatedAt: iso(1000) } }),
+    "run",
+  )
+  // Snooze is a bucket too: T3 keeps a running snoozed thread on the shelf.
+  assert.strictEqual(
+    st({
+      snoozedUntil: new Date(NOW + 3600000).toISOString(),
+      snoozedAt: iso(1000),
+      session: { status: "running", updatedAt: iso(2000) },
+    }),
+    "snooze",
+  )
+
+  // A live session beats an explicit settle, exactly as upstream does.
   assert.strictEqual(st({ settledOverride: "settled", hasPendingApprovals: true }), "needs")
   assert.strictEqual(
     st({ settledOverride: "settled", session: { status: "running", updatedAt: iso(1000) } }),
@@ -311,6 +456,36 @@ async function main() {
     "idle",
   )
 
+  // A pin suspends the settled bucket, so a pinned thread stays active past
+  // the auto-settle window instead of dropping into the settled list.
+  const stale = {
+    latestUserMessageAt: iso(5 * DAY_MS),
+    latestTurn: { state: "completed", requestedAt: iso(5 * DAY_MS), startedAt: iso(5 * DAY_MS), completedAt: iso(5 * DAY_MS) },
+  }
+  assert.strictEqual(st({ ...stale, pinnedAt: iso(6 * DAY_MS) }), "idle")
+  assert.strictEqual(st({ settledOverride: "settled", pinnedAt: iso(6 * DAY_MS) }), "idle")
+  // Snooze outranks a pin, as it does in the T3 sidebar.
+  assert.strictEqual(
+    st({ pinnedAt: iso(6 * DAY_MS), snoozedUntil: new Date(NOW + 3600000).toISOString(), snoozedAt: iso(1000) }),
+    "snooze",
+  )
+
+  // A finished plan-mode turn with a plan to accept is blocked on the user.
+  const planReady = { interactionMode: "plan", hasActionableProposedPlan: true }
+  assert.strictEqual(st(planReady), "needs")
+  // Only in plan mode, only once the turn has finished, and never while the
+  // user already has a question in front of them.
+  assert.strictEqual(st({ ...planReady, interactionMode: "default" }), "idle")
+  assert.strictEqual(st({ ...planReady, latestTurn: { state: "running", requestedAt: iso(60000), startedAt: iso(59000), completedAt: null } }), "idle")
+  assert.strictEqual(st({ ...planReady, hasPendingUserInput: true }), "needs")
+  // It is a status, not a settle blocker: T3 ages a stale plan out the same way.
+  assert.strictEqual(st({ ...planReady, ...stale }), "settled")
+  // The plan row carries T3's own words rather than an empty wait.
+  assert.strictEqual(
+    context.threadDetailLine(shellThread(planReady), "needs", NOW, null),
+    "plan ready",
+  )
+
   assert.strictEqual(st({ session: { status: "error", updatedAt: iso(1000) } }), "err")
   assert.strictEqual(st({ snoozedUntil: new Date(NOW + 3600000).toISOString(), snoozedAt: iso(1000) }), "snooze")
   // A snoozed thread that raises its hand is not hidden.
@@ -323,7 +498,44 @@ async function main() {
   assert.strictEqual(context.hasQueuedTurnStart(shellThread({ latestUserMessageAt: iso(5000), latestTurn: null }), NOW), true)
   assert.strictEqual(context.hasQueuedTurnStart(shellThread({ latestUserMessageAt: iso(10 * 60000), latestTurn: null }), NOW), false)
 
+  // --------------------------------------------------------- list ordering
+  // Active rows order by creation, as T3's sidebar does, so a row holds its
+  // place while its turns land instead of jumping to the top on every reply.
+  const ordering = {
+    threads: [
+      shellThread({ id: "old-busy", createdAt: iso(9 * DAY_MS), updatedAt: iso(1000), latestUserMessageAt: iso(1000), latestTurn: { state: "completed", requestedAt: iso(1000), startedAt: iso(1000), completedAt: iso(1000) } }),
+      shellThread({ id: "new-quiet", createdAt: iso(60000), updatedAt: iso(60000), latestUserMessageAt: iso(60000), latestTurn: { state: "completed", requestedAt: iso(60000), startedAt: iso(60000), completedAt: iso(60000) } }),
+      // Settled long ago, but the projection touched it a minute back: T3
+      // orders this by the work, not by the touch.
+      shellThread({ id: "stale-touched", createdAt: iso(30 * DAY_MS), updatedAt: iso(60000), latestUserMessageAt: iso(20 * DAY_MS), latestTurn: { state: "completed", requestedAt: iso(20 * DAY_MS), startedAt: iso(20 * DAY_MS), completedAt: iso(20 * DAY_MS) } }),
+      shellThread({ id: "settled-recent", createdAt: iso(30 * DAY_MS), updatedAt: iso(20 * DAY_MS), settledOverride: "settled", settledAt: iso(2000), latestUserMessageAt: iso(20 * DAY_MS), latestTurn: { state: "completed", requestedAt: iso(20 * DAY_MS), startedAt: iso(20 * DAY_MS), completedAt: iso(20 * DAY_MS) } }),
+    ],
+  }
+  assertJsonEqual(
+    context.threadsForScope(ordering, 0, NOW).map((t) => t.id),
+    ["new-quiet", "old-busy"],
+  )
+  // Settled rows are history: settledAt first, then when the work ended.
+  assertJsonEqual(
+    context.threadsForScope(ordering, 1, NOW).map((t) => t.id),
+    ["settled-recent", "stale-touched"],
+  )
+
   // ------------------------------------------------------------- roll-ups
+  // The counts speak for the whole machine, so they must not stop at the
+  // page size: a thread past MAX_SESSIONS still gets to raise its hand.
+  const crowd = { threads: [] }
+  for (let i = 0; i < context.MAX_SESSIONS + 5; i++) {
+    crowd.threads.push(shellThread({
+      id: "bulk-" + i,
+      createdAt: iso((i + 1) * 60000),
+      updatedAt: iso((i + 1) * 60000),
+      hasPendingApprovals: i === context.MAX_SESSIONS + 4,
+    }))
+  }
+  assert.strictEqual(context.liveThreads(crowd).length, context.MAX_SESSIONS + 5)
+  assert.strictEqual(context.rollupForThreads(context.liveThreads(crowd), NOW).needs, 1)
+
   assert.strictEqual(context.hostStateFromCounts({ needs: 1, run: 2, err: 0, idle: 3, settled: 4, total: 10 }), "needs")
   assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 2, err: 1, idle: 3, settled: 4, total: 10 }), "run")
   assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 1, idle: 3, settled: 4, total: 8 }), "err")
@@ -408,6 +620,10 @@ async function main() {
   sentMessages = []
   context.shellByServer = {}
   context.refreshHosts()
+  // PebbleKit JS ready and the watch's startup request can overlap. One poll
+  // already in flight is enough to answer both; duplicating it doubles Wi-Fi
+  // and server work without producing a newer snapshot.
+  context.refreshHosts()
 
   await waitFor(() => sentMessages.find((m) => m.cmd === CMD.hostEnd), "hostEnd-1")
   const hostRows = sentMessages.filter((m) => m.cmd === CMD.hostItem)
@@ -472,6 +688,10 @@ async function main() {
   await waitFor(() => sentMessages.find((m) => m.cmd === CMD.hostEnd), "hostEnd-dead-again")
   assert.strictEqual(sentMessages.filter((m) => m.cmd === CMD.hostItem).length, 0,
     "an unchanged offline row must not be re-sent")
+  assert.strictEqual(sentMessages.filter((m) => m.cmd === CMD.error).length, 0,
+    "an unchanged offline fault must not be re-sent")
+  assert.strictEqual(sentMessages.length, 1,
+    "a quiet offline poll should cost only its authoritative end marker")
   deadHosts = new Set()
 
   // ----------------------------------------------------- the thread screen
@@ -623,6 +843,12 @@ async function main() {
   assert.strictEqual(dispatches[1].threadId, dispatches[0].threadId)
   assert.strictEqual(dispatches[1].bootstrap, undefined)
 
+  dispatches = []
+  context.promptNewThread("s2::proj_mini", "use terra", "codex", "gpt-5.6-terra")
+  await waitFor(() => dispatches.length === 2, "dispatch-new-selected-model")
+  assertJsonEqual(dispatches[0].modelSelection, { instanceId: "codex", model: "gpt-5.6-terra" })
+  assertJsonEqual(dispatches[1].modelSelection, { instanceId: "codex", model: "gpt-5.6-terra" })
+
   // An id naming a host that is no longer configured cannot be dispatched.
   let unknownError = null
   context.dispatchForThread("s9::x", () => ({}), (error) => {
@@ -702,6 +928,7 @@ async function main() {
     bundle: { value: "" },
     pasteMsg: { textContent: "" },
     servers: { innerHTML: "" },
+    autoSettle: { value: "3" },
   }
   const page = {
     console,
@@ -733,12 +960,52 @@ async function main() {
   assert.match(els.pasteMsg.textContent, /No setup lines found/)
 
   // What the page saves must survive the bridge's own normalization.
+  els.autoSettle.value = "7"
   page.save()
   const saved = JSON.parse(decodeURIComponent(page.location.href.split("#")[1]))
   const round = context.normalizeSettings(saved)
   assert.strictEqual(round.servers.length, 2)
   assert.strictEqual(round.servers[0].label, "beta1")
   assert.strictEqual(round.servers[1].token, "tok_rotated")
+  assert.strictEqual(round.autoSettleAfterDays, 7)
+  // Blank is "never", which is a real T3 setting and not a missing value.
+  els.autoSettle.value = ""
+  page.save()
+  assert.strictEqual(
+    context.normalizeSettings(JSON.parse(decodeURIComponent(page.location.href.split("#")[1])))
+      .autoSettleAfterDays,
+    null,
+  )
+
+  // The window actually reaches the classifier: a thread quiet for five days
+  // is settled on a three-day window, still idle on a thirty-day one, and
+  // never settles at all when auto-settle is off.
+  const quiet = shellThread({
+    latestUserMessageAt: iso(5 * DAY_MS),
+    latestTurn: { state: "completed", requestedAt: iso(5 * DAY_MS), startedAt: iso(5 * DAY_MS), completedAt: iso(5 * DAY_MS) },
+  })
+  storedSettings = settingsFor([{ id: "s1", label: "a", baseUrl: "http://a:3773", token: "t" }])
+  context.settings()
+  assert.strictEqual(context.threadState(quiet, NOW), "settled")
+  storedSettings = JSON.stringify({
+    servers: [{ id: "s1", label: "a", baseUrl: "http://a:3773", token: "t" }],
+    nextServerId: 2, autoSettleAfterDays: 30,
+  })
+  context.settings()
+  assert.strictEqual(context.threadState(quiet, NOW), "idle")
+  storedSettings = JSON.stringify({
+    servers: [{ id: "s1", label: "a", baseUrl: "http://a:3773", token: "t" }],
+    nextServerId: 2, autoSettleAfterDays: null,
+  })
+  context.settings()
+  assert.strictEqual(context.threadState(quiet, NOW), "idle")
+  // An explicit settle still settles with auto-settle off.
+  assert.strictEqual(
+    context.threadState(shellThread({ settledOverride: "settled" }), NOW),
+    "settled",
+  )
+  storedSettings = null
+  context.settings()
 
   // --- dictated project names resolve to a path -------------------------
 

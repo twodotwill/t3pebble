@@ -98,7 +98,7 @@ fi
 
 # The orchestration API must reject an unauthenticated read.
 unauthenticated_status="$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' \
-  "$SMOKE_BASE_URL/api/orchestration/snapshot")"
+  "$SMOKE_BASE_URL/api/orchestration/shell")"
 if [[ "$unauthenticated_status" != "401" ]]; then
   echo "Expected 401 without a bearer token, got $unauthenticated_status." >&2
   exit 1
@@ -107,13 +107,13 @@ fi
 curl --max-time 10 -sS \
   -H "Authorization: Bearer $SMOKE_TOKEN" \
   -H "Accept: application/json" \
-  "$SMOKE_BASE_URL/api/orchestration/snapshot" >/tmp/t3pebble-smoke-snapshot.json
+  "$SMOKE_BASE_URL/api/orchestration/shell" >/tmp/t3pebble-smoke-snapshot.json
 
 node <<'NODE'
 const fs = require("node:fs");
 const snapshot = JSON.parse(fs.readFileSync("/tmp/t3pebble-smoke-snapshot.json", "utf8"));
 if (!Array.isArray(snapshot.projects) || !Array.isArray(snapshot.threads)) {
-  console.error("Snapshot did not include projects and threads arrays.");
+  console.error("Shell snapshot did not include projects and threads arrays.");
   process.exit(1);
 }
 NODE
@@ -146,8 +146,8 @@ const manifest = {
       "node test/bridge.integration.test.js",
       "pebble build",
       "stock T3 Code issues a bearer access token via t3 auth session issue",
-      "stock T3 Code rejects unauthenticated /api/orchestration/snapshot with 401",
-      "stock T3 Code serves /api/orchestration/snapshot to a bearer token",
+      "stock T3 Code rejects unauthenticated /api/orchestration/shell with 401",
+      "stock T3 Code serves /api/orchestration/shell to a bearer token",
     ],
   },
 };
