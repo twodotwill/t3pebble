@@ -2,7 +2,7 @@
   "//": "The single source of truth for the watch/phone wire protocol and the build label. Edit this file, then run `node tools/gen-protocol.js`. `node test/protocol.test.js` fails if the generated blocks in appinfo.json, src/c/main.c and src/pkjs/index.js have drifted from it.",
 
   "//buildLabel": "Two components only: the Pebble SDK rejects a versionLabel that is not Major or Major.Minor, and appinfo.json takes this with the leading v stripped.",
-  "buildLabel": "v0.6",
+  "buildLabel": "v0.7",
 
   "keys": [
     { "name": "cmd", "id": 0, "c": "KEY_CMD" },

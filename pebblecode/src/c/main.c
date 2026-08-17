@@ -66,7 +66,7 @@
 #define SCOPE_ACTIVE  0
 #define SCOPE_SETTLED 1
 
-#define BUILD_LABEL "v0.6"
+#define BUILD_LABEL "v0.7"
 /* @generated protocol:end */
 
 #define MAX_HOSTS 6
@@ -208,11 +208,10 @@ static Window *s_diag_window;
 static Layer *s_diag_layer;
 static MenuLayer *s_thread_menu;
 static Layer *s_host_layer;
-/* The pulsing state mark, lifted out of the full-screen host layer onto a
-   13x13 child of its own. It is the only thing that animates once a listing
-   has landed, and redrawing 45,600 pixels to move eleven of them is what the
-   9 Hz tick was actually spending the battery on. */
-static Layer *s_host_pulse_layer;
+/* The sweeping progress rail, lifted out of the full-screen host layer onto a
+   strip of its own. It is the only thing that moves on the home screen, and it
+   only moves while a refresh is in flight. */
+static Layer *s_host_rail_layer;
 static Layer *s_thread_chrome;
 static Layer *s_detail_header_layer;
 static Layer *s_detail_layer;
@@ -292,7 +291,7 @@ static char s_draw_body[MAX_CONTEXT_TEXT];
 
 static void log_error(const char *text);
 static void enter_error_state(const char *text);
-static void update_host_pulse(void);
+static void update_host_rail(void);
 static void request_refresh(void);
 static void request_detail(int index, bool full_context);
 static void request_context_page(int page);
@@ -547,7 +546,7 @@ static bool detail_window_visible(void) {
    it was doing that for a thread list nobody was looking at on every status
    change. */
 static void mark_all_dirty(void) {
-  update_host_pulse();
+  update_host_rail();
   if (host_window_visible() && s_host_layer) {
     layer_mark_dirty(s_host_layer);
   }
@@ -582,20 +581,22 @@ static bool any_live_session(void) {
   return false;
 }
 
-static bool any_live_row(void) {
-  if (any_live_session()) {
+/* The home screen is the one that gets left open for hours, so at rest it
+   animates nothing at all and registers no timer: a machine working somewhere
+   else is a fact, not an event, and a static mark says it just as well as a
+   pulsing one. The thread list is a surface you are actively looking at rather
+   than one you park on, so a running row there still breathes.
+
+   Anything with a request in flight animates on either screen, because that is
+   feedback rather than decoration, and it is over in seconds. */
+static bool animation_active(void) {
+  if (busy_any()) {
     return true;
   }
-  for (int i = 0; i < s_host_count; i++) {
-    if (s_hosts[i].run > 0) {
-      return true;
-    }
+  if (thread_window_visible()) {
+    return any_live_session();
   }
   return false;
-}
-
-static bool animation_active(void) {
-  return busy_any() || any_live_row();
 }
 
 /* The app is only worth animating while it is actually on the glass. A
@@ -608,14 +609,20 @@ static void stream_timer_callback(void *context) {
   bool busy = busy_any();
   s_stream_phase = (s_stream_phase + (busy ? 1 : IDLE_TICK_STEP)) % 240;
 
-  if (host_window_visible()) {
-    /* When a request is in flight the whole panel is carrying the state --
-       busy rail, SYNC label, self-test. When nothing is, the only thing moving
-       is the pulse, which now lives on its own small layer. */
-    if (busy && s_host_layer) {
+  if (host_window_visible() && busy) {
+    /* Only the rail moves during a refresh -- the counts, the headline and the
+       legend are settled until the reply lands. So the sweep gets a 200x6 strip
+       of its own and the panel underneath is left alone. A sleeping laptop
+       costs the full 8s probe timeout, which used to be 72 repaints of the
+       whole screen for an animation six pixels tall.
+
+       The self-test also animates, but only on the connecting screen, which is
+       busy by definition, so it rides the same repaint. */
+    if (s_host_rail_layer) {
+      layer_mark_dirty(s_host_rail_layer);
+    }
+    if (!s_hosts_synced && s_host_layer) {
       layer_mark_dirty(s_host_layer);
-    } else if (s_host_pulse_layer && !layer_get_hidden(s_host_pulse_layer)) {
-      layer_mark_dirty(s_host_pulse_layer);
     }
   }
   if (thread_window_visible()) {
@@ -662,17 +669,17 @@ static void update_stream_timer(void) {
   s_stream_timer = app_timer_register(interval, stream_timer_callback, NULL);
 }
 
-/* Both go through update_host_pulse: whether the pulse is drawn by its own
-   layer or by the panel underneath depends on whether anything is in flight. */
+/* Both go through update_host_rail: the sweep strip is shown exactly while
+   something is in flight, and hidden the rest of the time. */
 static void busy_set(int flags) {
   s_busy |= flags;
-  update_host_pulse();
+  update_host_rail();
   update_stream_timer();
 }
 
 static void busy_clear(int flags) {
   s_busy &= ~flags;
-  update_host_pulse();
+  update_host_rail();
   update_stream_timer();
 }
 
@@ -844,10 +851,17 @@ static void draw_rail(GContext *ctx, GRect bounds, int y, bool point_up) {
 /* Segment digits come from DSEG7, drawn the way a real panel works: the full
    "88" is laid down in the ghost tone first, the hatch knocks it back, then
    the live value goes on top. Nothing shifts when a digit is blank, because
-   DSEG is fixed-width and the unlit segments stay put. */
+   DSEG is fixed-width and the unlit segments stay put.
+
+   Every segment draw asks for GTextOverflowModeFill rather than the trailing
+   ellipsis used everywhere else. DSEG7 is subset to "[0-9:]", so it carries no
+   U+2026, and asking the layout for an ellipsis in a font that has none hangs
+   the firmware outright -- it never returns and the watch stops answering the
+   protocol. Fill is also what these readouts want: each one is a fixed-width
+   value drawn into a box measured from itself, so it can never overflow. */
 static GSize seg_text_size(const char *text, GFont font) {
   return graphics_text_layout_get_content_size(text, font, GRect(0, 0, 160, 80),
-                                               GTextOverflowModeTrailingEllipsis,
+                                               GTextOverflowModeFill,
                                                GTextAlignmentLeft);
 }
 
@@ -889,14 +903,14 @@ static void draw_seg_value(GContext *ctx, GPoint at, int value, GColor on, bool 
 
   graphics_context_set_text_color(ctx, lcd_ghost_tone());
   graphics_draw_text(ctx, "88", font, GRect(at.x, at.y, full.w + 4, full.h + 4),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
   hatch_rect(ctx, GRect(at.x, at.y, full.w + 2, full.h + 2));
 
   /* Right-aligned into the ghost so the ones column never moves. */
   graphics_context_set_text_color(ctx, on);
   graphics_draw_text(ctx, live, font,
                      GRect(at.x + full.w - live_w, at.y, live_w + 4, full.h + 4),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 }
 
 /* A BAT-style segmented meter. The reference spends this on battery; here it
@@ -1043,8 +1057,11 @@ static void sync_age_text(char *out, size_t size) {
   if (secs < 0) {
     secs = 0;
   }
+  /* Minute granularity, because nothing redraws this more often than that.
+     A live second count needs a timer running purely to animate a caption,
+     which is the cost this screen exists to avoid. */
   if (secs < 60) {
-    snprintf(out, size, "%ds", secs);
+    snprintf(out, size, "now");
   } else if (secs < 3600) {
     snprintf(out, size, "%dm", secs / 60);
   } else {
@@ -1089,13 +1106,17 @@ static int state_headline_count(const HostItem *host) {
 /* A square block, not a dot: the reference marks its day strip and battery in
    squares, and shape (filled / hollow / struck) carries the state on the
    monochrome watches where colour cannot. */
-static void draw_state_mark(GContext *ctx, GRect box, const char *state, bool inverted) {
+/* `animated` is false wherever the screen has to be free to sit still. Running
+   is already carried by colour and by the filled shape; the breathing is a
+   flourish, and on the home screen a flourish costs a timer that never stops. */
+static void draw_state_mark(GContext *ctx, GRect box, const char *state, bool inverted,
+                            bool animated) {
   GColor ink = inverted ? lcd_glass() : state_color(state);
   bool hollow = state_is(state, "settled") || state_is(state, "snooze") ||
                 state_is(state, "empty") || state_is(state, "offline");
 
   GRect mark = box;
-  if (state_is(state, "run")) {
+  if (animated && state_is(state, "run")) {
     int phase = (s_stream_phase / 4) % 8;
     int grow = phase < 4 ? phase : 8 - phase;
     mark = GRect(box.origin.x - grow / 2, box.origin.y - grow / 2,
@@ -1129,49 +1150,32 @@ static void draw_state_mark(GContext *ctx, GRect box, const char *state, bool in
    three counts, and the host strip along the bottom. UP/DOWN steps machines
    the way a mode button steps a watch. */
 
-/* Where the pulse sits. Constant once the segment metrics are measured, which
-   is exactly what lets it live on a layer of its own rather than being redrawn
-   as part of the whole panel. Mirrors the geometry in host_layer_update_proc:
-   the field box starts 33 below the panel top and is one small readout tall. */
-static GRect host_mark_box(void) {
-  int field_y = TOP_CHROME + 33;
-  int big_y = field_y + (s_seg_small.h + 6) + 6;
-  return GRect(PANEL_INSET + PANEL_W - 15, big_y + 4, 7, 7);
+/* The strip the progress sweep owns while a refresh is in flight. Covers the
+   static rail's tapered ends as well as the bar itself, so the two never show
+   through each other. */
+static GRect host_rail_box(void) {
+  /* Exactly the band draw_busy_rail paints: four rows above the rail, which is
+     what covers the static rail's upward taper, plus the rail itself. */
+  return GRect(0, LEGEND_HEIGHT - 4, SCREEN_W, RAIL_HEIGHT + 4);
 }
 
-/* The pulse is shown on its own layer only while nothing else is animating.
-   While a request is in flight the whole panel is repainting anyway, so the
-   host layer draws the mark itself and this stays hidden -- otherwise the two
-   would both paint it. */
-static void update_host_pulse(void) {
-  if (!s_host_pulse_layer) {
+static void update_host_rail(void) {
+  if (!s_host_rail_layer) {
     return;
-  }
-  bool show = false;
-  if (s_hosts_synced && s_host_count > 0 && !busy_any()) {
-    HostItem *host = &s_hosts[clamp_int(s_host_cursor, 0, s_host_count - 1)];
-    show = !state_is(host->state, "offline") &&
-           (state_is_live(host->state) || state_is(host->state, "needs"));
   }
   /* layer_set_hidden marks the parent dirty, so setting it to what it already
      is would schedule a full-panel repaint on every status change. */
-  bool hidden = !show;
-  if (layer_get_hidden(s_host_pulse_layer) != hidden) {
-    layer_set_hidden(s_host_pulse_layer, hidden);
+  bool hidden = !busy_any();
+  if (layer_get_hidden(s_host_rail_layer) != hidden) {
+    layer_set_hidden(s_host_rail_layer, hidden);
   }
 }
 
-static void host_pulse_update_proc(Layer *layer, GContext *ctx) {
+static void host_rail_update_proc(Layer *layer, GContext *ctx) {
   s_frame_count++;
-  GRect bounds = layer_get_bounds(layer);
-  graphics_context_set_fill_color(ctx, lcd_glass());
-  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-  if (s_host_count <= 0) {
-    return;
-  }
-  HostItem *host = &s_hosts[clamp_int(s_host_cursor, 0, s_host_count - 1)];
-  /* Inset by the margin the growing mark needs at its widest. */
-  draw_state_mark(ctx, GRect(3, 3, 7, 7), host->state, false);
+  /* Drawn in the strip's own coordinates, so the sweep's y is the offset of
+     the rail within the box rather than its position on the screen. */
+  draw_busy_rail(ctx, layer_get_bounds(layer), 4);
 }
 
 static void draw_self_test(GContext *ctx, GRect panel, const char *title, const char *hint) {
@@ -1184,16 +1188,22 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
     int x = panel.origin.x + (panel.size.w - full.w) / 2;
     graphics_context_set_text_color(ctx, lcd_ghost_tone());
     graphics_draw_text(ctx, "88:88", font, GRect(x, y, full.w + 4, full.h + 4),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
     hatch_rect(ctx, GRect(x, y, full.w + 2, full.h + 2));
 
-    /* One digit lights at a time, walking the field like a power-on test. */
-    static const char *steps[5] = { "8", " 8", "   8", "    8", "" };
-    int lit = (s_stream_phase / 6) % 6;
-    if (lit < 5 && steps[lit][0]) {
-      graphics_context_set_text_color(ctx, lcd_ink());
-      graphics_draw_text(ctx, steps[lit], font, GRect(x, y, full.w + 4, full.h + 4),
-                         GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    /* One digit lights at a time, walking the field like a power-on test --
+       but only while the phone is actually being waited on, which is the only
+       time this screen has a timer behind it. Settled states (no hosts, no
+       link) get the ghosted field alone rather than a walk frozen wherever the
+       last tick happened to leave it. */
+    if (busy_any()) {
+      static const char *steps[5] = { "8", " 8", "   8", "    8", "" };
+      int lit = (s_stream_phase / 6) % 6;
+      if (lit < 5 && steps[lit][0]) {
+        graphics_context_set_text_color(ctx, lcd_ink());
+        graphics_draw_text(ctx, steps[lit], font, GRect(x, y, full.w + 4, full.h + 4),
+                           GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+      }
     }
     y += full.h + 4;
   } else {
@@ -1238,11 +1248,10 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   }
   draw_legend_band(ctx, bounds, "T3 CODE", right);
 
-  if (busy) {
-    draw_busy_rail(ctx, bounds, LEGEND_HEIGHT);
-  } else {
-    draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
-  }
+  /* Always the static rail: s_host_rail_layer sits on top of it and carries the
+     sweep while a refresh is in flight, so the panel never has to repaint for
+     the animation. */
+  draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
   draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME, false);
 
   if (!s_hosts_synced) {
@@ -1352,10 +1361,12 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   draw_caption(ctx, of_line, GPoint(label_x, big_y + 17), lcd_ink());
   draw_caption(ctx, "TAP OPEN", GPoint(label_x, big_y + 30), lcd_ink());
 
-  /* Only when the pulse layer is not carrying it, which is the busy case. */
-  if ((state_is_live(host->state) || state_is(host->state, "needs")) &&
-      (!s_host_pulse_layer || layer_get_hidden(s_host_pulse_layer))) {
-    draw_state_mark(ctx, host_mark_box(), host->state, false);
+  /* Static. Colour and the filled shape already say "running"; making it
+     breathe would mean a timer that never stops on the screen most likely to
+     be left open. */
+  if (state_is_live(host->state) || state_is(host->state, "needs")) {
+    draw_state_mark(ctx, GRect(panel.origin.x + panel.size.w - 15, big_y + 4, 7, 7),
+                    host->state, false, false);
   }
 
   /* The indicator row: hairline, meter with its caption, sync age, and the
@@ -1383,13 +1394,7 @@ static void host_step(int delta) {
     return;
   }
   s_host_cursor = (s_host_cursor + delta + s_host_count) % s_host_count;
-  /* A different machine may or may not want the pulse. */
-  update_host_pulse();
-  if (s_host_pulse_layer) {
-    layer_mark_dirty(s_host_pulse_layer);
-  }
   layer_mark_dirty(s_host_layer);
-  update_stream_timer();
 }
 
 static void host_up_click(ClickRecognizerRef recognizer, void *context) {
@@ -1599,7 +1604,7 @@ static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
     graphics_fill_rect(ctx, GRect(6, bounds.size.h / 2 - 10, 3, 20), 0, GCornerNone);
   }
 
-  draw_state_mark(ctx, GRect(12, bounds.size.h / 2 - 9, 7, 7), state, false);
+  draw_state_mark(ctx, GRect(12, bounds.size.h / 2 - 9, 7, 7), state, false, true);
 
   graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, title, font_row_title(),
@@ -2827,11 +2832,11 @@ static void host_window_load(Window *window) {
 
   /* Added after the panel so it composites on top of it. Its frame never
      moves; only its visibility does. */
-  s_host_pulse_layer = layer_create(grect_inset(host_mark_box(), GEdgeInsets(-3)));
-  layer_set_update_proc(s_host_pulse_layer, host_pulse_update_proc);
-  layer_set_hidden(s_host_pulse_layer, true);
-  layer_add_child(window_layer, s_host_pulse_layer);
-  update_host_pulse();
+  s_host_rail_layer = layer_create(host_rail_box());
+  layer_set_update_proc(s_host_rail_layer, host_rail_update_proc);
+  layer_set_hidden(s_host_rail_layer, true);
+  layer_add_child(window_layer, s_host_rail_layer);
+  update_host_rail();
 
   window_set_click_config_provider(window, host_click_config);
 }
@@ -2840,11 +2845,11 @@ static void host_window_unload(Window *window) {
   if (s_host_layer) {
     layer_destroy(s_host_layer);
   }
-  if (s_host_pulse_layer) {
-    layer_destroy(s_host_pulse_layer);
+  if (s_host_rail_layer) {
+    layer_destroy(s_host_rail_layer);
   }
   s_host_layer = NULL;
-  s_host_pulse_layer = NULL;
+  s_host_rail_layer = NULL;
 }
 
 static void thread_window_load(Window *window) {
@@ -2943,6 +2948,20 @@ static void app_focus_changed(bool in_focus) {
   update_stream_timer();
 }
 
+/* With no animation timer on the home screen, the sync age has nothing to
+   refresh it: it would read "now" until the next poll five minutes later and
+   then jump. MINUTE_UNIT rides the tick the system already runs for the clock,
+   so it adds no wakeup of its own, and it is exactly the granularity
+   sync_age_text reports. One repaint a minute, and only if you are looking. */
+static void minute_tick(struct tm *tick_time, TimeUnits units_changed) {
+  if (host_window_visible() && s_host_layer) {
+    layer_mark_dirty(s_host_layer);
+  }
+  if (s_diag_layer && window_stack_get_top_window() == s_diag_window) {
+    layer_mark_dirty(s_diag_layer);
+  }
+}
+
 static void init(void) {
   s_launched_at = time(NULL);
   s_font_dot = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_20));
@@ -2950,8 +2969,8 @@ static void init(void) {
   s_font_dseg_big = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_64));
   s_font_dseg_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_20));
   lcd_tiles_create();
-  /* Before any window loads: host_window_load places the pulse layer from
-     these metrics. */
+  /* Before any window loads: the panel's field geometry is derived from
+     these, and host_window_load reads it. */
   lcd_metrics_measure();
 
   reset_hosts();
@@ -2988,6 +3007,7 @@ static void init(void) {
   app_message_register_outbox_failed(outbox_failed_callback);
   app_message_open(1024, 1024);
   app_focus_service_subscribe(app_focus_changed);
+  tick_timer_service_subscribe(MINUTE_UNIT, minute_tick);
 
   window_stack_push(s_host_window, true);
   update_stream_timer();
@@ -2996,6 +3016,7 @@ static void init(void) {
 
 static void deinit(void) {
   app_focus_service_unsubscribe();
+  tick_timer_service_unsubscribe();
   if (s_refresh_timer) {
     app_timer_cancel(s_refresh_timer);
   }

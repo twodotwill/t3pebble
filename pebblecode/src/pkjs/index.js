@@ -68,7 +68,7 @@ var CMD_SCREENSHOT_PAGE = 90;
 var SCOPE_ACTIVE = 0;
 var SCOPE_SETTLED = 1;
 
-var BUILD_LABEL = "v0.6";
+var BUILD_LABEL = "v0.7";
 // @generated protocol:end
 
 var MAX_SESSIONS = 20;
