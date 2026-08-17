@@ -105,6 +105,18 @@ const targets = [
       parsed.versionLabel = SPEC.buildLabel.replace(/^v/, "")
       return JSON.stringify(parsed, null, 2) + "\n"
     },
+    // Only appKeys and versionLabel are generated here; the rest of the file is
+    // hand-maintained. Comparing the whole thing byte-for-byte would report
+    // drift for any reformat that does not change a single value -- a
+    // characterRegex written as "…" rather than the literal character is
+    // the same regex, and the font resources genuinely need that character.
+    equivalent: (a, b) => {
+      const owned = (text) => {
+        const parsed = JSON.parse(text)
+        return JSON.stringify({ appKeys: parsed.appKeys, versionLabel: parsed.versionLabel })
+      }
+      return owned(a) === owned(b)
+    },
   },
 ]
 
@@ -137,7 +149,8 @@ function run(check) {
     const full = path.join(ROOT, target.file)
     const source = fs.readFileSync(full, "utf8")
     const next = target.render(source)
-    if (next === source) {
+    const matches = target.equivalent ? target.equivalent(source, next) : next === source
+    if (matches) {
       continue
     }
     if (check) {
